@@ -25,12 +25,15 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
 # 新增: 参考图相关参数
-parser.add_argument("--reference_images", type=str, nargs="+", default=None,
+parser.add_argument("--reference_images", type=str, nargs="*", default=None,
                     help="参考图像路径列表 (如: --reference_images human.png thing.png env.png)")
 parser.add_argument("--use_reference_image", action="store_true",
                     help="是否使用参考图像进行生成")
 parser.add_argument("--clip_path", type=str, default="Skywork/SkyReels-A2",
                     help="CLIP 模型路径")
+# 新增: 命令行 prompt 参数
+parser.add_argument("--prompt", type=str, default=None,
+                    help="直接指定生成 prompt (优先于配置文件中的 data_path)")
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
@@ -175,9 +178,29 @@ if getattr(config, "use_reference_image", False) and hasattr(pipeline, "clip_enc
     if local_rank == 0:
         print(f"CLIP encoder 已移动到 {device}")
 
-extended_prompt_path = config.data_path
-dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
-num_prompts = len(dataset)
+# 如果命令行指定了 prompt，则使用命令行 prompt
+if args.prompt:
+    # 创建临时的单条 prompt 数据（与 TextDataset 返回格式一致）
+    class SinglePromptDataset:
+        def __init__(self, prompt):
+            self.prompt = prompt
+        def __len__(self):
+            return 1
+        def __getitem__(self, idx):
+            # 返回格式与 TextDataset.__getitem__ 一致
+            return {
+                "prompts": self.prompt,  # 字符串，DataLoader 会包装成 batch
+                "extended_prompts": self.prompt,
+                "idx": idx,
+            }
+
+    dataset = SinglePromptDataset(args.prompt)
+    num_prompts = 1
+    print(f"使用命令行 prompt: {args.prompt}")
+else:
+    extended_prompt_path = config.data_path
+    dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
+    num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
 if dist.is_initialized():

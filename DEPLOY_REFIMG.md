@@ -71,17 +71,41 @@ cd longlive_modify
 chmod +x inference_refimg.sh
 
 # 基本用法
+bash inference_refimg.sh GPU_ID [参考图1] [参考图2] [参考图3] ["text prompt"]
+
+# 示例:
+# 无参考图，使用配置文件中的 prompt
+bash inference_refimg.sh 0
+
+# 只用 1 张参考图
+bash inference_refimg.sh 0 reference_images/human.png
+
+# 使用 2 张参考图
+bash inference_refimg.sh 0 reference_images/human.png reference_images/thing.png
+
+# 使用 3 张参考图 (原有用法)
 bash inference_refimg.sh 0 reference_images/human.png reference_images/thing.png reference_images/env.png
+
+# 无参考图，但指定命令行 prompt
+bash inference_refimg.sh 0 "a cat walking on the beach"
+
+# 1 张参考图 + 命令行 prompt
+bash inference_refimg.sh 0 reference_images/human.png "a person dancing in the rain"
+
+# 2 张参考图 + 命令行 prompt
+bash inference_refimg.sh 0 reference_images/human.png reference_images/thing.png "a person holding an object"
+
+# 3 张参考图 + 命令行 prompt
+bash inference_refimg.sh 0 reference_images/human.png reference_images/thing.png reference_images/env.png "a person with object in environment"
 
 # 参数说明:
 # $1: GPU ID (默认 0)
-# $2: 人物参考图路径
-# $3: 物体参考图路径
-# $4: 环境参考图路径
+# 后续参数: 自动识别 - 存在的图片文件作为参考图，其他字符串作为 text prompt
 ```
 
 ### 方式 B: 直接命令
 ```bash
+# 使用参考图 + 配置文件 prompt
 CUDA_VISIBLE_DEVICES=0 \
 torchrun \
   --nproc_per_node=1 \
@@ -91,6 +115,27 @@ torchrun \
   --use_reference_image \
   --reference_images human.png thing.png env.png \
   --clip_path "Skywork/SkyReels-A2"
+
+# 使用命令行 prompt (无参考图)
+CUDA_VISIBLE_DEVICES=0 \
+torchrun \
+  --nproc_per_node=1 \
+  --master_port=29502 \
+  inference.py \
+  --config_path configs/longlive_inference_refimg.yaml \
+  --prompt "a cat walking on the beach"
+
+# 参考图 + 命令行 prompt
+CUDA_VISIBLE_DEVICES=0 \
+torchrun \
+  --nproc_per_node=1 \
+  --master_port=29502 \
+  inference.py \
+  --config_path configs/longlive_inference_refimg.yaml \
+  --use_reference_image \
+  --reference_images human.png \
+  --clip_path "Skywork/SkyReels-A2" \
+  --prompt "a person dancing"
 ```
 
 ### 方式 C: 不使用参考图 (回退到普通模式)
