@@ -318,3 +318,68 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+
+def _crop_and_resize_pad(image, height=480, width=720):
+    """裁剪并调整图像大小，保持宽高比，用白色填充"""
+    import numpy as np
+    from PIL import Image as PILImage
+    image = np.array(image)
+    image_height, image_width = image.shape[:2]
+    if image_height / image_width < height / width:
+        pad = int((((height / width) * image_width) - image_height) / 2.)
+        padded_image = np.ones((image_height + pad * 2, image_width, 3), dtype=np.uint8) * 255
+        padded_image[pad:pad+image_height, :] = image
+        image = PILImage.fromarray(padded_image).resize((width, height))
+    else:
+        pad = int((((width / height) * image_height) - image_width) / 2.)
+        padded_image = np.ones((image_height, image_width + pad * 2, 3), dtype=np.uint8) * 255
+        padded_image[:, pad:pad+image_width] = image
+        image = PILImage.fromarray(padded_image).resize((width, height))
+    return image
+
+
+class WanCLIPEncoder(torch.nn.Module):
+    """CLIP 图像编码器，用于提取参考图的 high-level 语义特征"""
+
+    def __init__(self, clip_path: str = "Skywork/SkyReels-A2"):
+        super().__init__()
+        from transformers import CLIPVisionModel, CLIPImageProcessor
+
+        self.image_encoder = CLIPVisionModel.from_pretrained(
+            clip_path, subfolder="image_encoder", torch_dtype=torch.float32
+        ).eval().requires_grad_(False)
+        self.image_processor = CLIPImageProcessor.from_pretrained(
+            clip_path, subfolder="image_processor"
+        )
+
+    @property
+    def device(self):
+        return next(self.image_encoder.parameters()).device
+
+    def encode_image(self, image) -> torch.Tensor:
+        """编码单张图像
+
+        Args:
+            image: PIL.Image 对象
+        Returns:
+            clip_embeds: [1, 257, 1280]
+        """
+        # 预处理: 裁剪并调整到 512x512 (按 SkyReels-A2 范式)
+        image = _crop_and_resize_pad(image, height=512, width=512)
+        # CLIPImageProcessor 会进一步处理到模型期望的尺寸
+        inputs = self.image_processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        image_embeds = self.image_encoder(**inputs, output_hidden_states=True)
+        return image_embeds.hidden_states[-2]  # 倒数第二层
+
+    def forward(self, images: List) -> torch.Tensor:
+        """编码多张参考图并拼接
+
+        Args:
+            images: List[PIL.Image] 参考图像列表
+        Returns:
+            clip_embeds: [1, N*257, 1280]
+        """
+        clip_emb_list = [self.encode_image(img) for img in images]
+        return torch.cat(clip_emb_list, dim=1)

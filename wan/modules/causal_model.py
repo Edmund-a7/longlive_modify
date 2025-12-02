@@ -8,7 +8,10 @@ from wan.modules.model import (
     WAN_CROSSATTENTION_CLASSES,
     rope_params,
     MLPProj,
-    sinusoidal_embedding_1d
+    sinusoidal_embedding_1d,
+    WanDualCrossAttention,
+    CLIPProjMLP,
+    VAEProjMLP
 )
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -366,7 +369,8 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_dual_cross_attn=False):  # 新增参数
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -375,6 +379,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.use_dual_cross_attn = use_dual_cross_attn
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
@@ -382,11 +387,17 @@ class CausalWanAttentionBlock(nn.Module):
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
-                                                                      num_heads,
-                                                                      (-1, -1),
-                                                                      qk_norm,
-                                                                      eps)
+
+        # 交叉注意力: 支持双路或单路
+        if use_dual_cross_attn:
+            self.cross_attn = WanDualCrossAttention(dim, num_heads, qk_norm, eps)
+        else:
+            self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
+                                                                          num_heads,
+                                                                          (-1, -1),
+                                                                          qk_norm,
+                                                                          eps)
+
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -408,7 +419,12 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        # 新增参数: 双路交叉注意力
+        vae_context=None,
+        vae_context_lens=None,
+        vae_cache=None,
+        fused_cache=None
     ):
         r"""
         Args:
@@ -417,6 +433,10 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            vae_context(Tensor, optional): Shape [B, L_vae, C] - VAE encoder tokens
+            vae_context_lens(Tensor, optional): Shape [B]
+            vae_cache(dict, optional): VAE cross-attention cache
+            fused_cache(dict, optional): Fused cross-attention cache
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
@@ -429,7 +449,7 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start)
-        
+
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
         else:
@@ -440,9 +460,23 @@ class CausalWanAttentionBlock(nn.Module):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+        def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None,
+                           vae_context=None, vae_context_lens=None,
+                           vae_cache=None, fused_cache=None):
+            # 双路交叉注意力
+            if self.use_dual_cross_attn and vae_context is not None:
+                # context 此时是 fused_token = concat(t5, clip)
+                x = x + self.cross_attn(
+                    self.norm3(x),
+                    vae_context, context,
+                    vae_context_lens, context_lens,
+                    vae_cache, fused_cache
+                )
+            else:
+                # 原有单路交叉注意力
+                x = x + self.cross_attn(self.norm3(x), context,
+                                        context_lens, crossattn_cache=crossattn_cache)
+
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -452,8 +486,9 @@ class CausalWanAttentionBlock(nn.Module):
                      frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
-        
+        x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache,
+                           vae_context, vae_context_lens, vae_cache, fused_cache)
+
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
             return x, cache_update_info
@@ -520,7 +555,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_reference_image=False,  # 新增: 是否使用参考图
+                 clip_dim=1280,              # 新增: CLIP 嵌入维度
+                 vae_latent_dim=16):         # 新增: VAE latent 维度
         r"""
         Initialize the diffusion model backbone.
 
@@ -599,11 +637,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # 6 份向量对应每个 block 内的调制参数（自注意力和 FFN 的偏置/缩放等），
         # 类似 AdaLN 或调制器，驱动每一层根据时间步做条件化。
 
+        # 参考图相关
+        self.use_reference_image = use_reference_image
+        if use_reference_image:
+            self.clip_proj = CLIPProjMLP(clip_dim, dim)
+            self.vae_proj = VAEProjMLP(vae_latent_dim, dim)
+
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                                    use_dual_cross_attn=use_reference_image)
             for _ in range(num_layers)
         ])
 
@@ -903,7 +948,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        # 新增: 参考图相关参数
+        clip_embeds=None,       # [B, N*257, 1280] CLIP 编码
+        vae_latents=None,       # [B, 16, N, H, W] VAE 编码
+        vae_cache=None,         # VAE 交叉注意力缓存
+        fused_cache=None        # Fused 交叉注意力缓存
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -994,15 +1044,32 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context = torch.concat([context_clip, context], dim=1)
         # 如果有clip特征，会先得到图片的上下文编码，然后拼接起来
 
+        # 处理参考图 (双路交叉注意力)
+        vae_context = None
+        if self.use_reference_image and clip_embeds is not None:
+            # CLIP 投影: [B, N*257, 1280] -> [B, N*257, dim]
+            clip_tokens = self.clip_proj(clip_embeds)
+            # 构建 fused_context = concat(t5_token, clip_token)
+            context = torch.cat([context, clip_tokens], dim=1)
+
+        if self.use_reference_image and vae_latents is not None:
+            # VAE latent 展平并投影: [B, 16, N, H, W] -> [B, N*H*W, dim]
+            b, c, n, h, w = vae_latents.shape
+            vae_tokens = vae_latents.flatten(2).transpose(1, 2)  # [B, N*H*W, 16]
+            vae_context = self.vae_proj(vae_tokens)  # [B, N*H*W, dim]
+
         # arguments
         kwargs = dict(
             e=e0, # 时间调制张量
             seq_lens=seq_lens, # 序列长度
             grid_sizes=grid_sizes, # 网格大小
             freqs=self.freqs, # RoPE 频率张量
-            context=context, # 拼接后的上下文
+            context=context, # 拼接后的上下文 (fused_token when use_reference_image)
             context_lens=context_lens, # 上下文长度
-            block_mask=self.block_mask # 块级因果编码
+            block_mask=self.block_mask, # 块级因果编码
+            # 新增: 双路交叉注意力参数
+            vae_context=vae_context,
+            vae_context_lens=None
         )
         # 整理了传入各 Transformer 块的公共参数
 
@@ -1044,7 +1111,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        # 新增: 双路交叉注意力缓存
+                        "vae_cache": vae_cache[block_index] if vae_cache is not None else None,
+                        "fused_cache": fused_cache[block_index] if fused_cache is not None else None
                     }
                 )
                 # 注入当前 block 的状态

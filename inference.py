@@ -11,6 +11,7 @@ from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from PIL import Image
 
 from pipeline import (
     CausalInferencePipeline,
@@ -23,9 +24,37 @@ import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
+# 新增: 参考图相关参数
+parser.add_argument("--reference_images", type=str, nargs="+", default=None,
+                    help="参考图像路径列表 (如: --reference_images human.png thing.png env.png)")
+parser.add_argument("--use_reference_image", action="store_true",
+                    help="是否使用参考图像进行生成")
+parser.add_argument("--clip_path", type=str, default="Skywork/SkyReels-A2",
+                    help="CLIP 模型路径")
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
+
+# 合并命令行参数到配置中 (命令行优先)
+if args.use_reference_image:
+    config.use_reference_image = True
+if args.clip_path:
+    config.clip_path = args.clip_path
+
+# 加载参考图像
+reference_images = None
+if args.reference_images:
+    reference_images = []
+    for img_path in args.reference_images:
+        if os.path.exists(img_path):
+            img = Image.open(img_path).convert("RGB")
+            reference_images.append(img)
+            print(f"加载参考图像: {img_path}")
+        else:
+            print(f"警告: 参考图像不存在: {img_path}")
+    if len(reference_images) == 0:
+        reference_images = None
+        print("警告: 未能加载任何参考图像，将使用普通文本到视频模式")
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -140,6 +169,12 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
+# 移动 CLIP encoder 到设备 (如果使用参考图)
+if getattr(config, "use_reference_image", False) and hasattr(pipeline, "clip_encoder"):
+    pipeline.clip_encoder.to(device=device)
+    if local_rank == 0:
+        print(f"CLIP encoder 已移动到 {device}")
+
 extended_prompt_path = config.data_path
 dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
 num_prompts = len(dataset)
@@ -202,6 +237,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     print("sampled_noise.device", sampled_noise.device)
     # print("initial_latent.device", initial_latent.device)
     print("prompts", prompts)
+    if reference_images is not None:
+        print(f"使用 {len(reference_images)} 张参考图像进行生成")
     # Generate 81 frames
     # print('sampled_noise.shape', sampled_noise.shape, 'prompts', prompts)
     # print('pipeline.generator', pipeline.generator)
@@ -215,6 +252,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=True,
         low_memory=low_memory,
         profile=False,
+        reference_images=reference_images,  # 新增: 传递参考图像
     )
     
     end = time.time() - start

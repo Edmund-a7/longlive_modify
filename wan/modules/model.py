@@ -266,9 +266,122 @@ class WanI2VCrossAttention(WanSelfAttention):
         return x
 
 
+class CLIPProjMLP(nn.Module):
+    """CLIP 嵌入投影: 1280 → model_dim"""
+
+    def __init__(self, clip_dim=1280, model_dim=1536):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LayerNorm(clip_dim),
+            nn.Linear(clip_dim, model_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(model_dim, model_dim),
+            nn.LayerNorm(model_dim)
+        )
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class VAEProjMLP(nn.Module):
+    """VAE latent 投影: 16 → model_dim"""
+
+    def __init__(self, vae_dim=16, model_dim=1536):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LayerNorm(vae_dim),
+            nn.Linear(vae_dim, model_dim),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(model_dim, model_dim),
+            nn.LayerNorm(model_dim)
+        )
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class WanDualCrossAttention(nn.Module):
+    """双路交叉注意力: 共享 Q，独立 K/V
+
+    路径1: VAE encoder token (low-level 空间信息)
+    路径2: Fused token (high-level: text + clip)
+    """
+
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # 共享 Q 投影
+        self.q = nn.Linear(dim, dim)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+        # 路径1: VAE encoder token (low-level)
+        self.k_vae = nn.Linear(dim, dim)
+        self.v_vae = nn.Linear(dim, dim)
+        self.norm_k_vae = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+        # 路径2: Fused token (high-level: text + clip)
+        self.k_fused = nn.Linear(dim, dim)
+        self.v_fused = nn.Linear(dim, dim)
+        self.norm_k_fused = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+        # 输出投影
+        self.o = nn.Linear(dim, dim)
+
+    def forward(self, x, vae_context, fused_context,
+                vae_context_lens=None, fused_context_lens=None,
+                vae_cache=None, fused_cache=None):
+        """
+        Args:
+            x: [B, L, C] - 来自自注意力的输出 (Query 来源)
+            vae_context: [B, L_vae, C] - VAE encoder tokens
+            fused_context: [B, L_fused, C] - concat(t5_token, clip_token)
+        """
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # 共享 Q
+        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+
+        # 路径1: VAE cross-attention (支持缓存)
+        if vae_cache is not None and vae_cache.get("is_init", False):
+            k_vae = vae_cache["k"]
+            v_vae = vae_cache["v"]
+        else:
+            k_vae = self.norm_k_vae(self.k_vae(vae_context)).view(b, -1, n, d)
+            v_vae = self.v_vae(vae_context).view(b, -1, n, d)
+            if vae_cache is not None:
+                vae_cache["k"] = k_vae
+                vae_cache["v"] = v_vae
+                vae_cache["is_init"] = True
+
+        x_vae = flash_attention(q, k_vae, v_vae, k_lens=vae_context_lens)
+
+        # 路径2: Fused cross-attention (支持缓存)
+        if fused_cache is not None and fused_cache.get("is_init", False):
+            k_fused = fused_cache["k"]
+            v_fused = fused_cache["v"]
+        else:
+            k_fused = self.norm_k_fused(self.k_fused(fused_context)).view(b, -1, n, d)
+            v_fused = self.v_fused(fused_context).view(b, -1, n, d)
+            if fused_cache is not None:
+                fused_cache["k"] = k_fused
+                fused_cache["v"] = v_fused
+                fused_cache["is_init"] = True
+
+        x_fused = flash_attention(q, k_fused, v_fused, k_lens=fused_context_lens)
+
+        # 加性融合
+        x = x_vae.flatten(2) + x_fused.flatten(2)
+        x = self.o(x)
+        return x
+
+
 WAN_CROSSATTENTION_CLASSES = {
     't2v_cross_attn': WanT2VCrossAttention,
     'i2v_cross_attn': WanI2VCrossAttention,
+    'dual_cross_attn': WanDualCrossAttention,
 }
 
 

@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 import os
 
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder, _crop_and_resize_pad
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
 from utils.debug_option import DEBUG
@@ -17,7 +17,8 @@ class CausalInferencePipeline(torch.nn.Module):
             device,
             generator=None,
             text_encoder=None,
-            vae=None
+            vae=None,
+            clip_encoder=None
     ):
         super().__init__()
         # Step 1: Initialize all models
@@ -27,6 +28,12 @@ class CausalInferencePipeline(torch.nn.Module):
             **getattr(args, "model_kwargs", {}), is_causal=True) if generator is None else generator
         self.text_encoder = WanTextEncoder() if text_encoder is None else text_encoder
         self.vae = WanVAEWrapper() if vae is None else vae
+
+        # 参考图相关
+        self.use_reference_image = getattr(args, "use_reference_image", False)
+        if self.use_reference_image:
+            clip_path = getattr(args, "clip_path", "Skywork/SkyReels-A2")
+            self.clip_encoder = WanCLIPEncoder(clip_path) if clip_encoder is None else clip_encoder
 
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
@@ -61,6 +68,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        reference_images: List = None,  # 新增: 参考图像列表
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -69,6 +77,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            reference_images (List[PIL.Image], optional): 参考图像列表
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -83,7 +92,21 @@ class CausalInferencePipeline(torch.nn.Module):
             text_prompts=text_prompts
         ) # 用WanTextEncoder 编码文本,实际是umT5
         # "prompt_embeds": context
-        # 
+
+        # 编码参考图 (如果有)
+        clip_embeds = None
+        vae_latents = None
+        if self.use_reference_image and reference_images is not None:
+            # 计算像素空间的高度和宽度 (latent 空间是 60x104, 像素空间是 480x832)
+            pixel_height = height * 8  # VAE 下采样 8 倍
+            pixel_width = width * 8
+            ref_enc = self.encode_reference_images(
+                reference_images, pixel_height, pixel_width, noise.device, noise.dtype
+            )
+            clip_embeds = ref_enc["clip_embeds"]
+            vae_latents = ref_enc["vae_latents"]
+            conditional_dict["clip_embeds"] = clip_embeds
+            conditional_dict["vae_latents"] = vae_latents
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -148,6 +171,22 @@ class CausalInferencePipeline(torch.nn.Module):
         # 每块的字典包含k、v张量、is_init 标志
         # k、v 张量分别是batch_size=1, 上下文 token数量=512, 12, 128
 
+        # 初始化双路交叉注意力缓存 (如果使用参考图)
+        self.vae_cache = None
+        self.fused_cache = None
+        if self.use_reference_image and vae_latents is not None:
+            num_ref_images = vae_latents.shape[2]  # N
+            vae_h, vae_w = vae_latents.shape[3], vae_latents.shape[4]  # h, w
+            vae_token_len = num_ref_images * vae_h * vae_w
+            fused_token_len = 512 + num_ref_images * 257  # text + clip
+            self._initialize_dual_crossattn_cache(
+                batch_size=batch_size,
+                dtype=noise.dtype,
+                device=noise.device,
+                vae_token_len=vae_token_len,
+                fused_token_len=fused_token_len
+            )
+
         current_start_frame = 0
         self.generator.model.local_attn_size = self.local_attn_size
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
@@ -194,7 +233,12 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep, # 标记当前是哪个时间步的噪声级别
                         kv_cache=self.kv_cache1, # 刚刚设置好的kv_cache模板
                         crossattn_cache=self.crossattn_cache, # 刚刚设置好的crossattn_cache模板
-                        current_start=current_start_frame * self.frame_seq_length # 当前这段开始的token位置
+                        current_start=current_start_frame * self.frame_seq_length, # 当前这段开始的token位置
+                        # 新增: 参考图相关参数
+                        clip_embeds=clip_embeds,
+                        vae_latents=vae_latents,
+                        vae_cache=self.vae_cache,
+                        fused_cache=self.fused_cache
                     )
                     # 得到对当前3帧的干净latent，即x_0的估计，用于下一步加噪或最终输出。
                     # 拿着局部的噪声块 + 文本条件 + 缓存状态，跑一次 Wan Causal Transformer
@@ -217,7 +261,12 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        # 新增: 参考图相关参数
+                        clip_embeds=clip_embeds,
+                        vae_latents=vae_latents,
+                        vae_cache=self.vae_cache,
+                        fused_cache=self.fused_cache
                     )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
@@ -233,6 +282,11 @@ class CausalInferencePipeline(torch.nn.Module):
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
+                # 新增: 参考图相关参数
+                clip_embeds=clip_embeds,
+                vae_latents=vae_latents,
+                vae_cache=self.vae_cache,
+                fused_cache=self.fused_cache
             )
             # 把刚刚得到的干净帧再跑一遍模型，模型会把这些无噪帧当作“清洁上下文”写入 KV cache，
             # 使下一批帧生成时，缓存里保存的是最新的真实序列，而不是上一轮的噪声状态
@@ -326,6 +380,80 @@ class CausalInferencePipeline(torch.nn.Module):
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
+
+    def _initialize_dual_crossattn_cache(self, batch_size, dtype, device, vae_token_len, fused_token_len):
+        """
+        初始化双路交叉注意力缓存 (用于参考图)
+        vae_token_len: VAE encoder token 数量 (N*H*W)
+        fused_token_len: fused token 数量 (512 + N*257)
+        """
+        vae_cache = []
+        fused_cache = []
+
+        for _ in range(self.num_transformer_blocks):
+            vae_cache.append({
+                "k": None,
+                "v": None,
+                "is_init": False
+            })
+            fused_cache.append({
+                "k": None,
+                "v": None,
+                "is_init": False
+            })
+
+        self.vae_cache = vae_cache
+        self.fused_cache = fused_cache
+
+    def encode_reference_images(self, images, height, width, device, dtype):
+        """
+        编码参考图像
+
+        Args:
+            images: List[PIL.Image] 参考图像列表
+            height: 视频高度
+            width: 视频宽度
+            device: 设备
+            dtype: 数据类型
+
+        Returns:
+            dict: {"clip_embeds": Tensor, "vae_latents": Tensor}
+        """
+        import numpy as np
+        from PIL import Image
+        from torchvision import transforms
+
+        # CLIP 编码 (high-level)
+        clip_embeds = self.clip_encoder(images)  # [1, N*257, 1280]
+        clip_embeds = clip_embeds.to(device=device, dtype=dtype)
+
+        # VAE 编码 (low-level)
+        # 预处理: 转换为张量
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        vae_latents_list = []
+        for image in images:
+            # 裁剪并调整到视频分辨率
+            image_resized = _crop_and_resize_pad(image, height=height, width=width)
+            image_tensor = transform(image_resized).unsqueeze(0)  # [1, 3, H, W]
+            image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+            image_tensor = image_tensor.to(device=device, dtype=dtype)
+
+            # VAE 编码
+            vae_latent = self.vae.encode_to_latent(image_tensor)  # [1, 1, 16, h, w]
+            vae_latents_list.append(vae_latent)
+
+        # 拼接 VAE latents: [1, N, 16, h, w] -> [1, 16, N, h, w]
+        vae_latents = torch.cat(vae_latents_list, dim=1)  # [1, N, 16, h, w]
+        vae_latents = vae_latents.permute(0, 2, 1, 3, 4)  # [1, 16, N, h, w]
+
+        return {
+            "clip_embeds": clip_embeds,
+            "vae_latents": vae_latents
+        }
 
     def _set_all_modules_max_attention_size(self, local_attn_size_value: int):
         """

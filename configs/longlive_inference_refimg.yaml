@@ -1,0 +1,44 @@
+# LongLive 推理配置 - 带参考图支持
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+num_frame_per_block: 3
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+  # 新增: 启用参考图支持 (模型层面)
+  use_reference_image: true
+  clip_dim: 1280
+  vae_latent_dim: 16
+
+# inference
+data_path: longlive_models/prompts/infer_test.txt
+output_folder: videos/refimg
+inference_iter: -1
+num_output_frames: 120
+use_ema: false
+seed: 0
+num_samples: 1
+save_with_index: true
+global_sink: true
+context_noise: 0
+
+generator_ckpt: longlive_models/models/longlive_base.pt
+lora_ckpt: longlive_models/models/lora.pt
+
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# 新增: 参考图相关配置
+use_reference_image: true
+clip_path: "Skywork/SkyReels-A2"
