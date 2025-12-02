@@ -39,6 +39,7 @@ class CausalInferencePipeline(torch.nn.Module):
         # hard code for Wan2.1-T2V-1.3B
         self.num_transformer_blocks = 30
         self.frame_seq_length = 1560
+        # 30个 transformer block，每帧对应的 token数量 1560
 
         self.kv_cache1 = None
         self.args = args
@@ -74,12 +75,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
-        assert num_output_frames % self.num_frame_per_block == 0
-        num_blocks = num_output_frames // self.num_frame_per_block
+        # 1, 120, 16, 60, 104
+        assert num_output_frames % self.num_frame_per_block == 0 # 一共 120 帧，每个 block 3 帧
+        num_blocks = num_output_frames // self.num_frame_per_block # 40个 block
 
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
-        )
+        ) # 用WanTextEncoder 编码文本,实际是umT5
+        # "prompt_embeds": context
+        # 
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -92,6 +96,7 @@ class CausalInferencePipeline(torch.nn.Module):
             device=output_device,
             dtype=noise.dtype
         )
+        # 先定义 output 矩阵，1,120,16,60,104
 
         # Set up profiling if requested
         if profile:
@@ -109,12 +114,17 @@ class CausalInferencePipeline(torch.nn.Module):
         # Step 1: Initialize KV cache to all zeros
         local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
         kv_policy = ""
-        if local_attn_cfg != -1:
-            # local attention
+        if local_attn_cfg != -1: 
+            # 局部注意力 local attention cfg 12, 即 kv cache 一共 12 帧(9+3)
+            # frame_seq_length 1560是遵循 wan2.1设置的每帧对应的 token 数量，
+            # Wan 模型把每一帧视频的潜空间表示展平成一维序列后再交给 Transformer,
+            # kv_cache_size 18720
             kv_cache_size = local_attn_cfg * self.frame_seq_length
             kv_policy = f"int->local, size={local_attn_cfg}"
         else:
+            # 由于config 设置了local_attn_size=12,所以只用局部注意力，不用全局注意力
             # global attention
+            # 全局注意力 120 帧大窗口
             kv_cache_size = num_output_frames * self.frame_seq_length
             kv_policy = "global (-1)"
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
@@ -125,16 +135,24 @@ class CausalInferencePipeline(torch.nn.Module):
             device=noise.device,
             kv_cache_size_override=kv_cache_size
         )
+        # 为每个 transformer block 初始化 kv cache
+        # 每块的字典包含k、v张量、global_end、local_end
+        # k、v 张量分别是batch_size=1, kv_cache_size=12*1560, 12个 head, 128dim
         self._initialize_crossattn_cache(
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device
         )
+        # 为每个 transformer block 初始化 cross-attention cache
+        # 储存文本/图像cross的 k、v 张量
+        # 每块的字典包含k、v张量、is_init 标志
+        # k、v 张量分别是batch_size=1, 上下文 token数量=512, 12, 128
 
         current_start_frame = 0
         self.generator.model.local_attn_size = self.local_attn_size
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
-        self._set_all_modules_max_attention_size(self.local_attn_size)
+        self._set_all_modules_max_attention_size(self.local_attn_size * self.frame_seq_length)
+        # 把wan transformer中的 max_attention_size 属性都设置成 local_attn_size * frame_seq_length
 
         if profile:
             init_end.record()
@@ -143,32 +161,44 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 2: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
-        for current_num_frames in all_num_frames:
+        # [3,3,3,3,3,......,3] 一共40个3
+        for current_num_frames in all_num_frames: # 3
             if profile:
                 block_start.record()
 
             noisy_input = noise[
                 :, current_start_frame:current_start_frame + current_num_frames]
-
+            # current_start_frame 从0开始，每次加3
+            # current_num_frames = 3
             # Step 2.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
                 # print(f"current_timestep: {current_timestep}")
+                # current_timestep 1000
 
                 # set current timestep
                 timestep = torch.ones(
-                    [batch_size, current_num_frames],
+                    [batch_size, current_num_frames], 
+                    # batch_size 1 current_num_frames 3
                     device=noise.device,
-                    dtype=torch.int64) * current_timestep
+                    dtype=torch.int64) * current_timestep 
+                    # current_timestep 1000
+                # timestep = [1000,1000,1000] 
 
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                if index < len(self.denoising_step_list) - 1: 
+                    # index = 0
+                    # denosing_step_list = [1000, 750, 500, 250]
+                    # len(denosing_step_list) = 4
+                    _, denoised_pred = self.generator( # WanDiffusionWrapper
+                        noisy_image_or_video=noisy_input, # 3帧的 noise
+                        conditional_dict=conditional_dict, # 文本编码
+                        timestep=timestep, # 标记当前是哪个时间步的噪声级别
+                        kv_cache=self.kv_cache1, # 刚刚设置好的kv_cache模板
+                        crossattn_cache=self.crossattn_cache, # 刚刚设置好的crossattn_cache模板
+                        current_start=current_start_frame * self.frame_seq_length # 当前这段开始的token位置
                     )
+                    # 得到对当前3帧的干净latent，即x_0的估计，用于下一步加噪或最终输出。
+                    # 拿着局部的噪声块 + 文本条件 + 缓存状态，跑一次 Wan Causal Transformer
+                    # 得到当前帧组的去噪结果，同时更新缓存，为下一帧块继续生成做准备
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -176,6 +206,9 @@ class CausalInferencePipeline(torch.nn.Module):
                         next_timestep * torch.ones(
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                     ).unflatten(0, denoised_pred.shape[:2])
+                    # 进入下一个噪声级别
+                    # 根据当前的去噪结果，添加噪声得到下一个时间步的噪声输入
+                    # scheduler是FlowMatchScheduler
                 else:
                     # for getting real output
                     _, denoised_pred = self.generator(
@@ -188,8 +221,11 @@ class CausalInferencePipeline(torch.nn.Module):
                     )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
+            # 把当前帧块的去噪结果写回最终输出缓冲区
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            # 准备一个与 timestep 形状相同的，数值为 0的张量。
+            
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
@@ -198,6 +234,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
+            # 把刚刚得到的干净帧再跑一遍模型，模型会把这些无噪帧当作“清洁上下文”写入 KV cache，
+            # 使下一批帧生成时，缓存里保存的是最新的真实序列，而不是上一轮的噪声状态
+            # 也就是更新kv cache和cross-attention cache
 
             if profile:
                 block_end.record()
@@ -205,8 +244,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 block_time = block_start.elapsed_time(block_end)
                 block_times.append(block_time)
 
-            # Step 3.4: update the start and end frame indices
+            # Step 2.4: update the start and end frame indices
             current_start_frame += current_num_frames
+            # current_start_frame加三帧，即下一个循环就去噪下三帧了
 
         if profile:
             # End diffusion timing and synchronize CUDA
@@ -218,7 +258,9 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 3: Decode the output
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
+        # 把干净帧 decode 得到像素域视频
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        # 把值域从 [-1, 1] 映射到 [0, 1]确保图像合法
         if profile:
             # End VAE timing and synchronize CUDA
             vae_end.record()
@@ -242,6 +284,11 @@ class CausalInferencePipeline(torch.nn.Module):
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+        Wan2.1 设置的transformer 的 token 特征维度为 1536，
+        12 个 head，
+        每个 head 是 128 个特征维度，
+        前面的 frame_seq_length 是表示每帧的 token数量，1560，
+        算的是KV 缓存中每帧占多少槽位。
         """
         kv_cache1 = []
         # Determine cache size
@@ -268,6 +315,7 @@ class CausalInferencePipeline(torch.nn.Module):
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """
         Initialize a Per-GPU cross-attention cache for the Wan model.
+        512 是表示交叉注意力信息的 token数量
         """
         crossattn_cache = []
 

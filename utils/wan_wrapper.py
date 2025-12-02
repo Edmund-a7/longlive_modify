@@ -24,7 +24,7 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load("../../pretrained/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
         
@@ -33,7 +33,7 @@ class WanTextEncoder(torch.nn.Module):
             self.text_encoder = self.text_encoder.cuda()
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name="../../pretrained/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -73,7 +73,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path="../../pretrained/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -130,9 +130,9 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"../../pretrained/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(f"../../pretrained/{model_name}/")
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
@@ -234,25 +234,27 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
-
+        # 提取文本嵌入编码
         # [B, F] -> [B]
         if self.uniform_timestep:
             input_timestep = timestep[:, 0]
         else:
-            input_timestep = timestep
+            input_timestep = timestep # [1000,1000,1000]
 
         logits = None
         # X0 prediction
         if kv_cache is not None:
-            flow_pred = self.model(
+            flow_pred = self.model( # CausalWanModel
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                # noise是 BTCHW，Wan 内部是 BCTHW，所以要换维度
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
-                current_start=current_start,
+                current_start=current_start, # current_start = 0
                 cache_start=cache_start
             ).permute(0, 2, 1, 3, 4)
+            # 把噪声块和条件送进 CausalWanModel 做一次前向推理，得到推理结果
         else:
             if clean_x is not None:
                 # teacher forcing
@@ -284,11 +286,12 @@ class WanDiffusionWrapper(torch.nn.Module):
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
+            flow_pred=flow_pred.flatten(0, 1), 
             xt=noisy_image_or_video.flatten(0, 1),
             timestep=timestep.flatten(0, 1)
         ).unflatten(0, flow_pred.shape[:2])
-
+        # 前面返回的是flow_pred，再转换为扩散流程的x_0估计
+        # 即根据调度器反推出无噪潜变量，然后恢复成[batch,frame,c,h,w]格式，以便后续使用
         if logits is not None:
             return flow_pred, pred_x0, logits
 

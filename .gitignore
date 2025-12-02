@@ -1,6 +1,15 @@
 __pycache__
+.venv
 
 longlive_models
 wan_models
 
 videos
+
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.h5
+*.onnx
+*.safetensors

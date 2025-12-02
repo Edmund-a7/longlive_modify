@@ -19,6 +19,7 @@ from utils.dataset import TextDataset
 from utils.misc import set_seed
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
+import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, help="Path to the config file")
@@ -95,6 +96,7 @@ if config.generator_ckpt:
         pipeline.generator.load_state_dict(raw_gen_state_dict)
 
 # --------------------------- LoRA support (optional) ---------------------------
+
 from utils.lora_utils import configure_lora_for_model
 import peft
 
@@ -171,6 +173,7 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
 
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+    # 对每个 prompt 分别处理
     idx = batch_data['idx'].item()
 
     # For DataLoader batch_size=1, the batch_data is already a single item, but in a batch container
@@ -185,6 +188,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # For text-to-video, batch is just the text prompt
     prompt = batch['prompts'][0]
+    # 把当前 prompt 提取出来
     extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
     if extended_prompt is not None:
         prompts = [extended_prompt] * config.num_samples
@@ -193,8 +197,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     sampled_noise = torch.randn(
         [config.num_samples, config.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-    )
-
+    ) # 1, 120, 16, 60, 104
+    # 准备好去噪的噪声
     print("sampled_noise.device", sampled_noise.device)
     # print("initial_latent.device", initial_latent.device)
     print("prompts", prompts)
@@ -203,7 +207,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     # print('pipeline.generator', pipeline.generator)
     # print('pipeline.text_encoder', pipeline.text_encoder)
     # print('pipeline.vae', pipeline.vae)
-
+    start = time.time()
+    # 推理得到video
     video, latents = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts,
@@ -211,12 +216,19 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         low_memory=low_memory,
         profile=False,
     )
+    
+    end = time.time() - start
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
+    # 把张量从通道优先转换为标准的 [batch, time, height, width, channel] 排列
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
+    print(f"Generated {num_generated_frames} frames in {end:.2f} seconds")
 
     # Final output video
     video = 255.0 * torch.cat(all_video, dim=1)
+    # 沿时间维把分段结果串联成完整序列
+    # 乘以255得到像素值范围 [0, 255]
+    print("video.shape", video.shape)
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
@@ -243,6 +255,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             else:
                 output_path = os.path.join(config.output_folder, f'rank{rank}-{prompt[:100]}-{seed_idx}.mp4')
             write_video(output_path, video[seed_idx], fps=16)
+            # 保存视频
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break

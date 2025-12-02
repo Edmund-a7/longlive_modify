@@ -582,14 +582,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        # 把输入视频张量按照 patch_size分块为 3D patch，然后投影到高维空间 dim。
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim))
+        # 把上游文本编码压缩到模型主干维度，得到 [text_len, dim] 的固定长度文本上下文
 
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        # 接受基于时间步 t 的正弦余弦嵌入
+
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
+        # 将time_embedding的输出，将每个维度的时间特征扩展为 6*dim；
+        # 后续将前向的特征reshape为[B,F,6,dim]
+        # 6 份向量对应每个 block 内的调制参数（自注意力和 FFN 的偏置/缩放等），
+        # 类似 AdaLN 或调制器，驱动每一层根据时间步做条件化。
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
@@ -936,13 +944,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # 先把x(bcthw)中的每个u(cthw) 变为 bcthw，再变为 3D patch
         # print("patch embedding done")
-        grid_sizes = torch.stack(
+        grid_sizes = torch.stack(# 3,30,52
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        # 对每个 patch 取 THW，堆叠为[B,3]的张量，存储了批次中每个样本的 (时间, 高度, 宽度) 网格大小。
         x = [u.flatten(2).transpose(1, 2) for u in x]
+        # 把卷积输出在空间-时间维度上展平成序列
+        # flatten(2) 把 (T', H', W') 合成一个长度 L = T'·H'·W'，
+        # 表示 patch 数量，即[1, dim, L]
+        # 再transpose(1, 2) 变成 [1, L, dim]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        # 就是 L，即 patch 的数量 4680
+        assert seq_lens.max() <= seq_len # 32760
         x = torch.cat(x)
+        # 把列表里的 [1, L, dim] 拼成一个 batch [B, L, dim]
+        # 随后送入 Transformer blocks
         """
         torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
@@ -954,8 +971,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # with amp.autocast(dtype=torch.float32):
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
+        # 先展平时间步t，映射成固定频率的正余弦特征，再得到高维时间嵌入编码
         e0 = self.time_projection(e).unflatten(
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+        # 投影成与模型宽度一致的张量，并 unflatten 成 [B, 6, dim] 的结构，
+        # 即每个样本包含 6 组调制向量，供注意力与 FFN 子层使用。
+
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
         # print("time embedding done")
         # context
@@ -966,21 +987,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+        # 把文本prompt填充到统一长度，按 batch 堆叠张量。
         # print("text embedding done")
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+        # 如果有clip特征，会先得到图片的上下文编码，然后拼接起来
 
         # arguments
         kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.freqs,
-            context=context,
-            context_lens=context_lens,
-            block_mask=self.block_mask
+            e=e0, # 时间调制张量
+            seq_lens=seq_lens, # 序列长度
+            grid_sizes=grid_sizes, # 网格大小
+            freqs=self.freqs, # RoPE 频率张量
+            context=context, # 拼接后的上下文
+            context_lens=context_lens, # 上下文长度
+            block_mask=self.block_mask # 块级因果编码
         )
+        # 整理了传入各 Transformer 块的公共参数
+
         # print("kwargs done")
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -990,7 +1015,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
         for block_index, block in enumerate(self.blocks):
-            # print(f"block_index: {block_index}")
+            # print(f"block_index: {block_index}") # block_index: 0 block: CausalWanAttentionBlock
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
                     {
@@ -1022,8 +1047,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "cache_start": cache_start
                     }
                 )
+                # 注入当前 block 的状态
                 # print(f"forward no checkpointing")
                 result = block(x, **kwargs)
+                # 得到该 block结果
                 # Handle the result
                 if kv_cache is not None and isinstance(result, tuple):
                     x, block_cache_update_info = result
@@ -1032,6 +1059,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     cache_update_info = block_cache_update_info[:2]  # (current_end, local_end_index)
                 else:
                     x = result
+                    # 令x为当前结果
         # log_gpu_memory(f"in _forward_inference: {x[0].device}")
         # After all blocks are processed, apply cache updates in a single pass
         if kv_cache is not None and cache_update_infos:
@@ -1039,8 +1067,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+        # 让时间调制参与最终预测
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
+        # 利用此前记录的补丁栅格尺寸将 token 序列复原成 [C_out, F, H/8, W/8] 的视频块。
+        # 最后通过 torch.stack(x) 在新的 batch 维度上堆叠每个样本，得到统一形状的输出张量返回上游。
         return torch.stack(x)
 
     def _forward_train(
