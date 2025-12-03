@@ -1059,7 +1059,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         vae_context_lens = None
         if self.use_reference_image and clip_embeds is not None:
             # CLIP 投影: [B, N*257, 1280] -> [B, N*257, dim]
-            clip_tokens = self.clip_proj(clip_embeds)
+            # 获取投影层的 dtype (可能是 float32)，确保输入匹配
+            clip_proj_dtype = next(self.clip_proj.parameters()).dtype
+            clip_embeds_casted = clip_embeds.to(dtype=clip_proj_dtype)
+            clip_tokens = self.clip_proj(clip_embeds_casted).to(dtype=context.dtype)
             # 构建 fused_context = concat(t5_token, clip_token)
             context = torch.cat([context, clip_tokens], dim=1)
             # 更新 context_lens
@@ -1069,7 +1072,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             # VAE latent 展平并投影: [B, 16, N, H, W] -> [B, N*H*W, dim]
             b, c, n, h, w = vae_latents.shape
             vae_tokens = vae_latents.flatten(2).transpose(1, 2)  # [B, N*H*W, 16]
-            vae_context = self.vae_proj(vae_tokens)  # [B, N*H*W, dim]
+            # 获取投影层的 dtype (可能是 float32)，确保输入匹配
+            vae_proj_dtype = next(self.vae_proj.parameters()).dtype
+            vae_tokens_casted = vae_tokens.to(dtype=vae_proj_dtype)
+            vae_context = self.vae_proj(vae_tokens_casted).to(dtype=context.dtype)  # [B, N*H*W, dim]
             # 计算 vae_context_lens
             vae_context_lens = torch.tensor([vae_context.size(1)] * b, dtype=torch.long, device=vae_context.device)
 

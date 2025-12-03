@@ -161,7 +161,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.post_init()
 
     def _materialize_meta_tensors(self):
-        """将 meta tensor 转为真实的 CPU tensor 并进行初始化"""
+        """将 meta tensor 转为真实的 CPU tensor 并进行初始化，
+        同时将所有新创建的层转换为与模型其他部分一致的 dtype"""
         # 获取模型中非 meta tensor 的 dtype 作为参考
         reference_dtype = None
         for p in self.model.parameters():
@@ -171,6 +172,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         if reference_dtype is None:
             reference_dtype = torch.float32
 
+        # 处理 meta tensors
         for name, param in self.model.named_parameters():
             if param.is_meta:
                 # 使用与模型其他参数一致的 dtype
@@ -190,6 +192,20 @@ class WanDiffusionWrapper(torch.nn.Module):
                 for part in parts[:-1]:
                     parent_module = getattr(parent_module, part)
                 setattr(parent_module, parts[-1], nn.Parameter(materialized, requires_grad=param.requires_grad))
+
+        # 将新创建的投影层转换为参考 dtype (这些层不是 meta tensor，但 dtype 可能是 float32)
+        if hasattr(self.model, 'clip_proj'):
+            self.model.clip_proj = self.model.clip_proj.to(dtype=reference_dtype)
+        if hasattr(self.model, 'vae_proj'):
+            self.model.vae_proj = self.model.vae_proj.to(dtype=reference_dtype)
+
+        # 将双路交叉注意力中的新层转换为参考 dtype
+        for block in self.model.blocks:
+            if hasattr(block, 'cross_attn') and hasattr(block.cross_attn, 'k_vae'):
+                # 这是 WanDualCrossAttention，需要转换 VAE 相关的层
+                block.cross_attn.k_vae = block.cross_attn.k_vae.to(dtype=reference_dtype)
+                block.cross_attn.v_vae = block.cross_attn.v_vae.to(dtype=reference_dtype)
+                block.cross_attn.norm_k_vae = block.cross_attn.norm_k_vae.to(dtype=reference_dtype)
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
