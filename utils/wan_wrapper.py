@@ -141,6 +141,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                 clip_dim=clip_dim,
                 vae_latent_dim=vae_latent_dim
             )
+            # 处理 meta tensor：将新增层的 meta tensor 转为真实 tensor
+            if use_reference_image:
+                self._materialize_meta_tensors()
         else:
             self.model = WanModel.from_pretrained(f"../../pretrained/{model_name}/")
         self.model.eval()
@@ -156,6 +159,20 @@ class WanDiffusionWrapper(torch.nn.Module):
         # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
         self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
         self.post_init()
+
+    def _materialize_meta_tensors(self):
+        """将 meta tensor 转为真实的 CPU tensor 并进行初始化"""
+        for name, param in self.model.named_parameters():
+            if param.is_meta:
+                # 创建真实的 tensor 并用 Xavier 初始化
+                materialized = torch.empty(param.shape, dtype=param.dtype, device='cpu')
+                nn.init.xavier_uniform_(materialized) if materialized.dim() >= 2 else nn.init.zeros_(materialized)
+                # 替换 meta tensor
+                parent_module = self.model
+                parts = name.split('.')
+                for part in parts[:-1]:
+                    parent_module = getattr(parent_module, part)
+                setattr(parent_module, parts[-1], nn.Parameter(materialized, requires_grad=param.requires_grad))
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
