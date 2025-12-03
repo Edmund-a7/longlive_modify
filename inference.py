@@ -125,7 +125,12 @@ if config.generator_ckpt:
             if len(unexpected) > 0:
                 print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:8]} ...")
     else:
-        pipeline.generator.load_state_dict(raw_gen_state_dict)
+        missing, unexpected = pipeline.generator.load_state_dict(raw_gen_state_dict, strict=False)
+        if local_rank == 0:
+            if len(missing) > 0:
+                print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint: {missing[:5]} ...")
+            if len(unexpected) > 0:
+                print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:5]} ...")
 
 # --------------------------- LoRA support (optional) ---------------------------
 
