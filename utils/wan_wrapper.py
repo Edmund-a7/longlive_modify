@@ -162,11 +162,28 @@ class WanDiffusionWrapper(torch.nn.Module):
 
     def _materialize_meta_tensors(self):
         """将 meta tensor 转为真实的 CPU tensor 并进行初始化"""
+        # 获取模型中非 meta tensor 的 dtype 作为参考
+        reference_dtype = None
+        for p in self.model.parameters():
+            if not p.is_meta:
+                reference_dtype = p.dtype
+                break
+        if reference_dtype is None:
+            reference_dtype = torch.float32
+
         for name, param in self.model.named_parameters():
             if param.is_meta:
+                # 使用与模型其他参数一致的 dtype
+                dtype = reference_dtype if param.dtype == torch.float32 else param.dtype
                 # 创建真实的 tensor 并用 Xavier 初始化
-                materialized = torch.empty(param.shape, dtype=param.dtype, device='cpu')
-                nn.init.xavier_uniform_(materialized) if materialized.dim() >= 2 else nn.init.zeros_(materialized)
+                materialized = torch.empty(param.shape, dtype=dtype, device='cpu')
+                if materialized.dim() >= 2:
+                    # Xavier 初始化需要 float32，初始化后再转换
+                    materialized_float = materialized.float()
+                    nn.init.xavier_uniform_(materialized_float)
+                    materialized = materialized_float.to(dtype)
+                else:
+                    nn.init.zeros_(materialized)
                 # 替换 meta tensor
                 parent_module = self.model
                 parts = name.split('.')
