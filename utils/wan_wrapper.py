@@ -124,13 +124,23 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            # 参考图相关参数
+            use_reference_image=False,
+            clip_dim=1280,
+            vae_latent_dim=16
     ):
         super().__init__()
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"../../pretrained/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"../../pretrained/{model_name}/",
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                use_reference_image=use_reference_image,
+                clip_dim=clip_dim,
+                vae_latent_dim=vae_latent_dim
+            )
         else:
             self.model = WanModel.from_pretrained(f"../../pretrained/{model_name}/")
         self.model.eval()
