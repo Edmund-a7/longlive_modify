@@ -464,14 +464,24 @@ class CausalWanAttentionBlock(nn.Module):
                            vae_context=None, vae_context_lens=None,
                            vae_cache=None, fused_cache=None):
             # 双路交叉注意力
-            if self.use_dual_cross_attn and vae_context is not None:
-                # context 此时是 fused_token = concat(t5, clip)
-                x = x + self.cross_attn(
-                    self.norm3(x),
-                    vae_context, context,
-                    vae_context_lens, context_lens,
-                    vae_cache, fused_cache
-                )
+            if self.use_dual_cross_attn:
+                if vae_context is not None:
+                    # context 此时是 fused_token = concat(t5, clip)
+                    x = x + self.cross_attn(
+                        self.norm3(x),
+                        vae_context, context,
+                        vae_context_lens, context_lens,
+                        vae_cache, fused_cache
+                    )
+                else:
+                    # 没有参考图时，用空的 vae_context 调用双路注意力
+                    # 只使用 fused 路径 (即原始 text context)
+                    x = x + self.cross_attn(
+                        self.norm3(x),
+                        None, context,
+                        None, context_lens,
+                        None, fused_cache
+                    )
             else:
                 # 原有单路交叉注意力
                 x = x + self.cross_attn(self.norm3(x), context,
@@ -1046,17 +1056,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # 处理参考图 (双路交叉注意力)
         vae_context = None
+        vae_context_lens = None
         if self.use_reference_image and clip_embeds is not None:
             # CLIP 投影: [B, N*257, 1280] -> [B, N*257, dim]
             clip_tokens = self.clip_proj(clip_embeds)
             # 构建 fused_context = concat(t5_token, clip_token)
             context = torch.cat([context, clip_tokens], dim=1)
+            # 更新 context_lens
+            context_lens = torch.tensor([context.size(1)] * context.size(0), dtype=torch.long, device=context.device)
 
         if self.use_reference_image and vae_latents is not None:
             # VAE latent 展平并投影: [B, 16, N, H, W] -> [B, N*H*W, dim]
             b, c, n, h, w = vae_latents.shape
             vae_tokens = vae_latents.flatten(2).transpose(1, 2)  # [B, N*H*W, 16]
             vae_context = self.vae_proj(vae_tokens)  # [B, N*H*W, dim]
+            # 计算 vae_context_lens
+            vae_context_lens = torch.tensor([vae_context.size(1)] * b, dtype=torch.long, device=vae_context.device)
 
         # arguments
         kwargs = dict(
@@ -1069,7 +1084,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask, # 块级因果编码
             # 新增: 双路交叉注意力参数
             vae_context=vae_context,
-            vae_context_lens=None
+            vae_context_lens=vae_context_lens
         )
         # 整理了传入各 Transformer 块的公共参数
 
@@ -1087,8 +1102,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
+                        "crossattn_cache": crossattn_cache[block_index] if crossattn_cache is not None else None,
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        # 新增: 双路交叉注意力缓存
+                        "vae_cache": vae_cache[block_index] if vae_cache is not None else None,
+                        "fused_cache": fused_cache[block_index] if fused_cache is not None else None
                     }
                 )
                 # print(f"forward checkpointing")

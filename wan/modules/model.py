@@ -336,7 +336,7 @@ class WanDualCrossAttention(nn.Module):
         """
         Args:
             x: [B, L, C] - 来自自注意力的输出 (Query 来源)
-            vae_context: [B, L_vae, C] - VAE encoder tokens
+            vae_context: [B, L_vae, C] - VAE encoder tokens (可为 None)
             fused_context: [B, L_fused, C] - concat(t5_token, clip_token)
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
@@ -345,18 +345,20 @@ class WanDualCrossAttention(nn.Module):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         # 路径1: VAE cross-attention (支持缓存)
-        if vae_cache is not None and vae_cache.get("is_init", False):
-            k_vae = vae_cache["k"]
-            v_vae = vae_cache["v"]
-        else:
-            k_vae = self.norm_k_vae(self.k_vae(vae_context)).view(b, -1, n, d)
-            v_vae = self.v_vae(vae_context).view(b, -1, n, d)
-            if vae_cache is not None:
-                vae_cache["k"] = k_vae
-                vae_cache["v"] = v_vae
-                vae_cache["is_init"] = True
+        x_vae = None
+        if vae_context is not None:
+            if vae_cache is not None and vae_cache.get("is_init", False):
+                k_vae = vae_cache["k"]
+                v_vae = vae_cache["v"]
+            else:
+                k_vae = self.norm_k_vae(self.k_vae(vae_context)).view(b, -1, n, d)
+                v_vae = self.v_vae(vae_context).view(b, -1, n, d)
+                if vae_cache is not None:
+                    vae_cache["k"] = k_vae
+                    vae_cache["v"] = v_vae
+                    vae_cache["is_init"] = True
 
-        x_vae = flash_attention(q, k_vae, v_vae, k_lens=vae_context_lens)
+            x_vae = flash_attention(q, k_vae, v_vae, k_lens=vae_context_lens)
 
         # 路径2: Fused cross-attention (支持缓存)
         if fused_cache is not None and fused_cache.get("is_init", False):
@@ -372,8 +374,11 @@ class WanDualCrossAttention(nn.Module):
 
         x_fused = flash_attention(q, k_fused, v_fused, k_lens=fused_context_lens)
 
-        # 加性融合
-        x = x_vae.flatten(2) + x_fused.flatten(2)
+        # 加性融合 (如果没有 vae_context，只用 fused)
+        if x_vae is not None:
+            x = x_vae.flatten(2) + x_fused.flatten(2)
+        else:
+            x = x_fused.flatten(2)
         x = self.o(x)
         return x
 
