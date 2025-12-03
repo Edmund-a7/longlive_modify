@@ -128,9 +128,19 @@ if config.generator_ckpt:
         missing, unexpected = pipeline.generator.load_state_dict(raw_gen_state_dict, strict=False)
         if local_rank == 0:
             if len(missing) > 0:
-                print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint: {missing[:5]} ...")
+                print(f"[Warning] {len(missing)} parameters are missing when loading checkpoint:")
+                for m in missing[:20]:
+                    print(f"  MISSING: {m}")
+                if len(missing) > 20:
+                    print(f"  ... and {len(missing) - 20} more")
             if len(unexpected) > 0:
-                print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint: {unexpected[:5]} ...")
+                print(f"[Warning] {len(unexpected)} unexpected parameters encountered when loading checkpoint:")
+                for u in unexpected[:20]:
+                    print(f"  UNEXPECTED: {u}")
+                if len(unexpected) > 20:
+                    print(f"  ... and {len(unexpected) - 20} more")
+            if len(missing) == 0 and len(unexpected) == 0:
+                print("[Info] All weights loaded successfully from generator checkpoint!")
 
 # --------------------------- LoRA support (optional) ---------------------------
 
