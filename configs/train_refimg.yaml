@@ -1,0 +1,100 @@
+# Reference Image Flow Matching Training Configuration
+# 参考图 Flow Matching 训练配置
+#
+# 用途：训练参考图相关的新增层（clip_proj, vae_proj, k_vae/v_vae/norm_k_vae）
+# 数据格式：JSONL，每行包含 {"video_path": "...", "prompt": "...", "reference_images": [...]}
+
+trainer: refimg_flow_matching
+
+# ==================== 模型配置 ====================
+model_name: Wan2.1-T2V-1.3B
+
+# 基础权重（双路交叉注意力格式）
+generator_ckpt: longlive_models/models/longlive_base_dual.pt
+
+# LoRA 权重（可选，已迁移到双路格式）
+lora_ckpt: longlive_models/models/lora_dual.pt
+
+# 参考图编码器
+clip_path: Skywork/SkyReels-A2
+clip_dim: 1280
+vae_latent_dim: 16
+
+# 是否也训练 fused 路径（默认只训练 vae 路径）
+train_fused_path: false
+
+# ==================== 训练超参数（与 longlive 保持一致）====================
+num_train_timestep: 1000
+timestep_shift: 5.0
+min_step_ratio: 0.02
+max_step_ratio: 0.98
+denoising_loss_type: flow
+
+# 优化器（与 longlive_train_long 保持一致）
+lr: 1.0e-05
+beta1: 0.0
+beta2: 0.999
+weight_decay: 0.01
+
+# 批次配置
+batch_size: 1
+gradient_accumulation_steps: 1
+max_grad_norm: 1.0
+
+# 训练步数
+max_iters: 3000
+log_iters: 50
+max_checkpoints: 3
+
+# ==================== 数据配置 ====================
+# JSONL 数据文件路径
+data_path: data/refimg_training.jsonl
+
+# 视频和图片根目录（可选，如果 JSONL 中是相对路径则需要）
+video_root: ""
+image_root: ""
+
+# 视频帧配置
+num_training_frames: 21
+frame_interval: 1
+num_frame_per_block: 3
+
+# 像素空间尺寸
+pixel_height: 480
+pixel_width: 832
+
+# 数据加载
+num_workers: 4
+
+# ==================== 分布式训练 ====================
+mixed_precision: true
+sharding_strategy: hybrid_full
+generator_fsdp_wrap_strategy: size
+gradient_checkpointing: true
+
+# ==================== LoRA 配置（可选）====================
+# 如果要对新增层也使用 LoRA 微调，取消注释以下配置
+# adapter:
+#   type: "lora"
+#   rank: 256
+#   alpha: 256
+#   dropout: 0.0
+#   dtype: "bfloat16"
+#   verbose: true
+
+# ==================== 模型架构参数 ====================
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+
+# ==================== 日志配置 ====================
+seed: 0
+wandb_key: YOUR_WANDB_KEY
+wandb_entity: YOUR_WANDB_ENTITY
+wandb_project: longlive-refimg
+disable_wandb: true
+
+# ==================== 其他 ====================
+auto_resume: true
+gc_interval: 100
