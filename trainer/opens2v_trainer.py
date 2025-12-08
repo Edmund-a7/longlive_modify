@@ -194,17 +194,9 @@ class OpenS2VTrainer:
         # 从配置中读取 OpenS2V 数据集路径
         json_paths = config.opens2v.json_paths
         video_base_paths = config.opens2v.video_base_paths
-        background_base_paths = config.opens2v.background_base_paths
-
-        # 可选的跨帧数据路径
-        cross_frames_cluster_path = getattr(config.opens2v, "cross_frames_cluster_path", "")
-        cross_frames_base_path = getattr(config.opens2v, "cross_frames_base_path", "")
-        is_cross_frame = getattr(config, "is_cross_frame", False)
 
         # OpenS2V 数据集参数
         dataset_kwargs = {
-            "cross_frames_cluster_path": cross_frames_cluster_path,
-            "cross_frames_base_path": cross_frames_base_path,
             "height": config.pixel_height,
             "width": config.pixel_width,
             "sample_num_frames": config.num_training_frames,
@@ -217,9 +209,7 @@ class OpenS2VTrainer:
         raw_dataloader = create_opens2v_dataloader(
             json_paths=json_paths,
             video_base_paths=video_base_paths,
-            background_base_paths=background_base_paths,
             batch_size=1,  # OpenS2V 先用 batch_size=1 生成样本
-            is_cross_frame=is_cross_frame,
             shuffle=True,
             num_workers=getattr(config, "num_workers", 4),
             **dataset_kwargs
@@ -231,9 +221,9 @@ class OpenS2VTrainer:
         if self.is_main_process:
             print(f"  OpenS2V dataset initialized")
             print(f"    JSON paths: {json_paths}")
+            print(f"    Video paths: {video_base_paths}")
             print(f"    Batch size: {config.batch_size}")
             print(f"    Num frames: {config.num_training_frames}")
-            print(f"    is_cross_frame: {is_cross_frame}")
             print(f"    Subject selection: {dataset_kwargs['subject_selection']}")
 
         # 梯度累积

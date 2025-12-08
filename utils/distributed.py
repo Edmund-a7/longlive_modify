@@ -46,6 +46,14 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
 
     os.environ["NCCL_CROSS_NIC"] = "1"
 
+    # hybrid_shard 策略需要 world_size >= 4，否则自动降级为 full_shard
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if sharding_strategy in ("hybrid_full", "hybrid_zero2") and world_size < 4:
+        if dist.get_rank() == 0 if dist.is_initialized() else True:
+            print(f"  Warning: {sharding_strategy} requires >= 4 GPUs, but world_size={world_size}. "
+                  f"Falling back to 'full_shard'.")
+        sharding_strategy = "full"
+
     sharding_strategy = {
         "full": ShardingStrategy.FULL_SHARD,
         "hybrid_full": ShardingStrategy.HYBRID_SHARD,

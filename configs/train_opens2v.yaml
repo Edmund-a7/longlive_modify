@@ -24,41 +24,40 @@ model_kwargs:
 
 # ========================= 数据配置 =========================
 # OpenS2V 数据集路径
-# 注意：使用 total_part1.json 格式的数据
-# JSON 格式示例:
+# 数据准备步骤：
+#   1. 下载 total_part1.json.zip 并解压
+#   2. 下载对应的视频文件 (total_part1.tar)
+#   3. 配置下面的路径
+#
+# JSON 格式示例 (total_part1.json):
 #   {
 #     "key_id": {
 #       "metadata": {
 #         "path": "part_xxx/video_id/video.mp4",  # 相对于 video_base_path
-#         "face_cut": [start, end],  # 有效帧范围
+#         "face_cut": [start, end],               # 有效帧范围
+#         "crop": [s_x, e_x, s_y, e_y],           # 裁剪区域（去水印）
 #         "face_cap_qwen": "描述文本",
-#         ...
 #       },
-#       "annotation": {...}
+#       "annotation": {
+#         "ann_frame_data": {"ann_frame_idx": 200, "annotations": [...]},
+#         "mask_map": {"1": {"class_name": "person"}, ...},
+#         "mask_annotation": {"200": {"1": {"counts": "...", ...}}}
+#       }
 #     }
 #   }
 opens2v:
   json_paths:
-    # 修改为你的实际路径，可以使用 total_part1.json
-    - "../total_part1.json"
+    # 修改为你的实际路径
+    - "/path/to/OpenS2V-5M/Jsons/mask_and_bbox/total_part1.json"
   video_base_paths:
-    # 视频根目录，JSON 中的 path 字段会相对于此路径
-    - "/path/to/OpenS2V-5M/videos"
-  background_base_paths:
-    # 背景图片目录，存放 {key}.png 格式的背景图
-    - "/path/to/OpenS2V-5M/backgrounds"
-
-  # 跨帧数据 (可选，is_cross_frame=False 时不使用)
-  cross_frames_cluster_path: ""
-  cross_frames_base_path: ""
+    # 视频根目录，JSON 中的 path 字段会相对于此路径拼接
+    # 例如: video_base_path + "/" + "part_xxx/video_id/video.mp4"
+    - "/path/to/OpenS2V-5M/Videos/total_part1"
 
   # 数据集参数
   sample_stride: 3  # 帧采样步长
   max_subjects_per_sample: 1  # 每个样本使用的 subject 数量
   subject_selection: "first"  # 'first', 'random', 'best_score'
-
-# 是否使用跨帧数据
-is_cross_frame: false
 
 # ========================= 视频参数 =========================
 # 注意：训练帧数应该能被 num_frame_per_block 整除

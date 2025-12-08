@@ -13,3 +13,6 @@ videos
 *.h5
 *.onnx
 *.safetensors
+
+# Large data files
+total_part1.json
