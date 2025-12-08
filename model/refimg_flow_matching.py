@@ -231,18 +231,24 @@ class RefImgFlowMatchingModel(nn.Module):
             log_dict: 日志字典
         """
         batch_size = len(text_prompts)
-        num_frames = video_frames.shape[1]
+        num_frames_pixel = video_frames.shape[1]
         device = self.device
 
         # Step 1: 编码视频为 latent (x0)
         # video_frames: [B, T, C, H, W] -> [B, C, T, H, W]
         video_for_vae = video_frames.permute(0, 2, 1, 3, 4)
         with torch.no_grad():
-            x0 = self.vae.encode_to_latent(video_for_vae)  # [B, T, 16, h, w]
+            x0 = self.vae.encode_to_latent(video_for_vae)  # [B, T_latent, 16, h, w]
+
+        # VAE 有 4x 时间压缩，latent 帧数 = (pixel_frames + 3) // 4
+        # 例如: 49 帧 -> 13 latent frames, 21 帧 -> 6 latent frames
+        num_frames_latent = x0.shape[1]
 
         # Step 2: 编码文本
         with torch.no_grad():
             conditional_dict = self.text_encoder(text_prompts)
+        # 将 text embeddings 转换为列表格式供模型使用
+        context_list = [conditional_dict["prompt_embeds"][i] for i in range(batch_size)]
 
         # Step 3: 编码参考图
         clip_embeds, vae_latents = self.encode_reference_images(
@@ -252,29 +258,37 @@ class RefImgFlowMatchingModel(nn.Module):
         # Step 4: 采样随机噪声
         noise = torch.randn_like(x0)
 
-        # Step 5: 采样随机时间步
-        timesteps = self._get_timestep(batch_size, num_frames)  # [B, F]
+        # Step 5: 采样随机时间步 (基于 latent 帧数)
+        timesteps = self._get_timestep(batch_size, num_frames_latent)  # [B, F_latent]
 
         # Step 6: 计算 x_t = (1 - sigma_t) * x0 + sigma_t * noise
         # 获取每帧的 sigma
-        sigmas = self.scheduler.sigmas[timesteps]  # [B, F]
-        sigmas = sigmas.view(batch_size, num_frames, 1, 1, 1)  # [B, F, 1, 1, 1]
+        sigmas = self.scheduler.sigmas[timesteps]  # [B, F_latent]
+        sigmas = sigmas.view(batch_size, num_frames_latent, 1, 1, 1)  # [B, F_latent, 1, 1, 1]
 
         x_t = (1 - sigmas) * x0 + sigmas * noise
 
         # Step 7: 准备时间步 (转换为调度器的时间步格式)
         timesteps_for_model = self.scheduler.timesteps[
             (self.num_train_timestep - 1 - timesteps).clamp(0, self.num_train_timestep - 1)
-        ]  # [B, F]
+        ]  # [B, F_latent]
 
         # Step 8: 前向传播
-        flow_pred, _ = self.generator(
-            noisy_image_or_video=x_t,
-            conditional_dict=conditional_dict,
-            timestep=timesteps_for_model.float(),
+        # 将 x_t 转换为模型期望的格式: [B, F, C, H, W] -> [B, C, F, H, W]
+        x_t_for_model = x_t.permute(0, 2, 1, 3, 4)  # [B, 16, F, h, w]
+
+        # 调用训练前向传播 (不需要 kv_cache)
+        flow_pred = self.generator.model(
+            x_t_for_model,
+            t=timesteps_for_model.float(),
+            context=context_list,
+            seq_len=self.generator.seq_len,
             clip_embeds=clip_embeds,
             vae_latents=vae_latents
-        )
+        )  # [B, 16, F, h, w]
+
+        # 转回 [B, F, C, H, W] 格式
+        flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
 
         # Step 9: 计算 Flow Matching 损失
         # target = noise - x0 (velocity field)
@@ -294,6 +308,8 @@ class RefImgFlowMatchingModel(nn.Module):
         log_dict = {
             "flow_loss": loss.detach(),
             "timestep_mean": timesteps.float().mean().detach(),
+            "num_frames_pixel": num_frames_pixel,
+            "num_frames_latent": num_frames_latent,
         }
 
         return loss, log_dict

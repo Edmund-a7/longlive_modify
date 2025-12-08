@@ -1,5 +1,6 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
+import os
 import types
 from typing import List, Optional
 import torch
@@ -12,10 +13,23 @@ from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 
+# 预训练模型路径配置
+# 可以通过环境变量 PRETRAINED_MODEL_PATH 覆盖
+# 默认路径: ../../pretrained/
+PRETRAINED_BASE_PATH = os.environ.get("PRETRAINED_MODEL_PATH", "../../pretrained")
+
+
+def get_pretrained_path(model_name: str = "Wan2.1-T2V-1.3B") -> str:
+    """获取预训练模型路径"""
+    return os.path.join(PRETRAINED_BASE_PATH, model_name)
+
 
 class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, pretrained_path: str = None) -> None:
         super().__init__()
+
+        if pretrained_path is None:
+            pretrained_path = get_pretrained_path()
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -23,17 +37,22 @@ class WanTextEncoder(torch.nn.Module):
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
-        self.text_encoder.load_state_dict(
-            torch.load("../../pretrained/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
-                       map_location='cpu', weights_only=False)
-        )
-        
+
+        t5_weights_path = os.path.join(pretrained_path, "models_t5_umt5-xxl-enc-bf16.pth")
+        if os.path.exists(t5_weights_path):
+            self.text_encoder.load_state_dict(
+                torch.load(t5_weights_path, map_location='cpu', weights_only=False)
+            )
+        else:
+            print(f"[Warning] T5 weights not found at {t5_weights_path}, using random initialization")
+
         # Move text encoder to GPU if available
         if torch.cuda.is_available():
             self.text_encoder = self.text_encoder.cuda()
 
+        tokenizer_path = os.path.join(pretrained_path, "google/umt5-xxl/")
         self.tokenizer = HuggingfaceTokenizer(
-            name="../../pretrained/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=tokenizer_path, seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -58,7 +77,7 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, pretrained_path: str = None):
         super().__init__()
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -71,11 +90,19 @@ class WanVAEWrapper(torch.nn.Module):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
+        if pretrained_path is None:
+            pretrained_path = get_pretrained_path()
+
+        vae_path = os.path.join(pretrained_path, "Wan2.1_VAE.pth")
+
         # init model
         self.model = _video_vae(
-            pretrained_path="../../pretrained/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=vae_path if os.path.exists(vae_path) else None,
             z_dim=16,
         ).eval().requires_grad_(False)
+
+        if not os.path.exists(vae_path):
+            print(f"[Warning] VAE weights not found at {vae_path}, using random initialization")
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
@@ -132,9 +159,11 @@ class WanDiffusionWrapper(torch.nn.Module):
     ):
         super().__init__()
 
+        pretrained_path = get_pretrained_path(model_name)
+
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"../../pretrained/{model_name}/",
+                pretrained_path,
                 local_attn_size=local_attn_size,
                 sink_size=sink_size,
                 use_reference_image=use_reference_image,
@@ -145,7 +174,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             if use_reference_image:
                 self._materialize_meta_tensors()
         else:
-            self.model = WanModel.from_pretrained(f"../../pretrained/{model_name}/")
+            self.model = WanModel.from_pretrained(pretrained_path)
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep

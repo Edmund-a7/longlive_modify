@@ -9,6 +9,15 @@ OpenS2V 数据集适配器
 目标：生成的视频，包含参考图中的主体
 数据：is_cross_frame=False
 训练：冻结原模型，只训练新模块
+
+数据格式说明 (total_part1.json):
+- key: "aKAianF3-zQ_segment_2_step1-166-511_step2-166-345_step4_step5_step6"
+- metadata.path: "part_5154/aKAianF3-zQ/aKAianF3-zQ_segment_2.mp4"
+- metadata.face_cut: [start, end] - 有效帧范围
+- metadata.face_cap_qwen: "描述文本"
+- annotation.ann_frame_data.ann_frame_idx: 注释帧索引
+- annotation.mask_map: class_name 映射
+- annotation.mask_annotation: RLE 格式 mask
 """
 
 import os
@@ -26,7 +35,14 @@ OPENS2V_PATH = Path(__file__).parent.parent.parent / "OpenS2V-Nexus" / "data_pro
 if str(OPENS2V_PATH) not in sys.path:
     sys.path.insert(0, str(OPENS2V_PATH))
 
-from demo_dataloader import OpenS2VDataset, MultiPartOpenS2VDataset
+# 尝试导入 OpenS2V 数据加载器
+try:
+    from demo_dataloader import OpenS2VDataset
+    HAS_OPENS2V = True
+except ImportError:
+    HAS_OPENS2V = False
+    print("[Warning] Could not import OpenS2VDataset from demo_dataloader. "
+          "Make sure OpenS2V-Nexus is installed or update OPENS2V_PATH.")
 
 
 class OpenS2VAdapterDataset(Dataset):
@@ -36,10 +52,14 @@ class OpenS2VAdapterDataset(Dataset):
     将 OpenS2V 数据格式转换为 longlive_modify 的训练格式：
     - subject_image + text -> video
 
+    注意：
+    - JSON 中的 path 格式为 "part_xxx/video_id/video.mp4"
+    - video_base_path 应该是包含 part_xxx 目录的父目录
+
     Args:
-        json_path: OpenS2V JSON 文件路径
-        video_base_path: 视频基础路径
-        background_base_path: 背景图片基础路径
+        json_path: OpenS2V JSON 文件路径 (例如 total_part1.json)
+        video_base_path: 视频根目录 (path 字段会相对于此路径拼接)
+        background_base_path: 背景图片目录 (存放 {key}.png 格式的背景图)
         is_cross_frame: 是否使用跨帧数据 (默认 False)
         height: 视频高度 (默认 480)
         width: 视频宽度 (默认 832)
@@ -66,8 +86,19 @@ class OpenS2VAdapterDataset(Dataset):
     ):
         self.max_subjects = max_subjects_per_sample
         self.subject_selection = subject_selection
+        self.video_base_path = video_base_path
+        self.background_base_path = background_base_path
+
+        if not HAS_OPENS2V:
+            raise ImportError(
+                "OpenS2VDataset is required but not available. "
+                "Please install OpenS2V-Nexus or fix the import path."
+            )
 
         # 创建底层的 OpenS2V 数据集
+        # 注意：video_base_path 需要匹配 OpenS2VDataset 的路径拼接逻辑
+        # OpenS2VDataset 会做: video_base_path.replace(main_part, cross_part) + "/" + metadata.path
+        # 对于 total_part1.json, main_part 会是 video_base_path 的最后一个目录名
         self.opens2v_dataset = OpenS2VDataset(
             json_path=json_path,
             video_base_path=video_base_path,

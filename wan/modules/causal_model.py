@@ -1179,15 +1179,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        # 新增: 参考图相关参数
+        clip_embeds=None,       # [B, N*257, 1280] CLIP 编码
+        vae_latents=None,       # [B, 16, N, H, W] VAE 编码
     ):
         r"""
-        Forward pass through the diffusion model
+        Forward pass through the diffusion model for training.
 
         Args:
             x (List[Tensor]):
                 List of input video tensors, each with shape [C_in, F, H, W]
             t (Tensor):
-                Diffusion timesteps tensor of shape [B]
+                Diffusion timesteps tensor of shape [B] or [B, F]
             context (List[Tensor]):
                 List of text embeddings each with shape [L, C]
             seq_len (`int`):
@@ -1196,14 +1199,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            clip_embeds (Tensor, *optional*):
+                CLIP embeddings for reference images [B, N*257, 1280]
+            vae_latents (Tensor, *optional*):
+                VAE latents for reference images [B, 16, N, H, W]
 
         Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+            Tensor:
+                Denoised video tensor with shape [B, C_out, F, H / 8, W / 8]
         """
-        pass
-        raise NotImplementedError()
-    
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
@@ -1211,57 +1215,81 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
+        # 获取输入维度信息
+        # x 可能是 Tensor [B, C, F, H, W] 或 List[Tensor]
+        if isinstance(x, torch.Tensor):
+            # x: [B, C, F, H, W] -> List[Tensor] 每个 [C, F, H, W]
+            x_list = [x[i] for i in range(x.shape[0])]
+            num_frames = x.shape[2]
+            frame_h, frame_w = x.shape[3], x.shape[4]
+        else:
+            x_list = x
+            num_frames = x_list[0].shape[1]
+            frame_h, frame_w = x_list[0].shape[2], x_list[0].shape[3]
+
+        frame_seqlen = (frame_h // self.patch_size[1]) * (frame_w // self.patch_size[2])
+
+        # Construct blockwise causal attn mask for training
+        if self.block_mask is None or self._check_mask_needs_update(num_frames, frame_seqlen):
             if clean_x is not None:
                 if self.independent_first_frame:
                     raise NotImplementedError()
                 else:
                     self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames,
+                        frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block
                     )
             else:
                 if self.independent_first_frame:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames,
+                        frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
                 else:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames,
+                        frame_seqlen=frame_seqlen,
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
+            # 记录当前 mask 参数
+            self._mask_num_frames = num_frames
+            self._mask_frame_seqlen = frame_seqlen
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            x_list = [torch.cat([u, v], dim=0) for u, v in zip(x_list, y)]
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        x_list = [self.patch_embedding(u.unsqueeze(0)) for u in x_list]
 
         grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x_list])
+        x_list = [u.flatten(2).transpose(1, 2) for u in x_list]
 
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        seq_lens = torch.tensor([u.size(1) for u in x_list], dtype=torch.long)
         assert seq_lens.max() <= seq_len
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
-                      dim=1) for u in x
+                      dim=1) for u in x_list
         ])
 
         # time embeddings
-        # with amp.autocast(dtype=torch.float32):
+        # 处理 timestep: 如果是 [B, F] 取第一列，如果是 [B] 直接使用
+        if t.dim() == 2:
+            t_for_emb = t[:, 0]  # [B]
+        else:
+            t_for_emb = t  # [B]
+
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
-        e0 = self.time_projection(e).unflatten(
-            1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            sinusoidal_embedding_1d(self.freq_dim, t_for_emb).type_as(x))
+
+        # 对于 block 调制，需要扩展到帧维度
+        # e0: [B, F, 6, dim]
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))  # [B, 6, dim]
+        e0 = e0.unsqueeze(1).expand(-1, num_frames, -1, -1)  # [B, F, 6, dim]
 
         # context
         context_lens = None
@@ -1276,6 +1304,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
+        # 处理参考图 (双路交叉注意力)
+        vae_context = None
+        vae_context_lens = None
+        if self.use_reference_image and clip_embeds is not None:
+            # CLIP 投影: [B, N*257, 1280] -> [B, N*257, dim]
+            clip_proj_dtype = next(self.clip_proj.parameters()).dtype
+            clip_embeds_casted = clip_embeds.to(dtype=clip_proj_dtype)
+            clip_tokens = self.clip_proj(clip_embeds_casted).to(dtype=context.dtype)
+            # 构建 fused_context = concat(t5_token, clip_token)
+            context = torch.cat([context, clip_tokens], dim=1)
+            # 更新 context_lens
+            context_lens = torch.tensor([context.size(1)] * context.size(0), dtype=torch.long, device=context.device)
+
+        if self.use_reference_image and vae_latents is not None:
+            # VAE latent 展平并投影: [B, 16, N, H, W] -> [B, N*H*W, dim]
+            b, c, n, h, w = vae_latents.shape
+            vae_tokens = vae_latents.flatten(2).transpose(1, 2)  # [B, N*H*W, 16]
+            vae_proj_dtype = next(self.vae_proj.parameters()).dtype
+            vae_tokens_casted = vae_tokens.to(dtype=vae_proj_dtype)
+            vae_context = self.vae_proj(vae_tokens_casted).to(dtype=context.dtype)  # [B, N*H*W, dim]
+            vae_context_lens = torch.tensor([vae_context.size(1)] * b, dtype=torch.long, device=vae_context.device)
+
         if clean_x is not None:
             clean_x = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
             clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
@@ -1288,11 +1338,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
             x = torch.cat([clean_x, x], dim=1)
             if aug_t is None:
-                aug_t = torch.zeros_like(t)
+                aug_t = torch.zeros_like(t_for_emb)
             e_clean = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
-            e0_clean = self.time_projection(e_clean).unflatten(
-                1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+                sinusoidal_embedding_1d(self.freq_dim, aug_t).type_as(x))
+            e0_clean = self.time_projection(e_clean).unflatten(1, (6, self.dim))
+            e0_clean = e0_clean.unsqueeze(1).expand(-1, num_frames, -1, -1)
             e0 = torch.cat([e0_clean, e0], dim=1)
 
         # arguments
@@ -1303,7 +1353,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=self.block_mask,
+            # 新增: 双路交叉注意力参数
+            vae_context=vae_context,
+            vae_context_lens=vae_context_lens)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -1323,11 +1376,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             x = x[:, x.shape[1] // 2:]
 
         # head
-        x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
+        x = self.head(x, e.unsqueeze(1).unsqueeze(2).expand(-1, num_frames, -1, -1))
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x)
+
+    def _check_mask_needs_update(self, num_frames, frame_seqlen):
+        """检查是否需要更新 block_mask"""
+        if not hasattr(self, '_mask_num_frames') or not hasattr(self, '_mask_frame_seqlen'):
+            return True
+        return self._mask_num_frames != num_frames or self._mask_frame_seqlen != frame_seqlen
 
     def forward(
         self,

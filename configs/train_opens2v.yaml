@@ -7,6 +7,11 @@
 #   数据：is_cross_frame=False
 #   训练：冻结原模型，只训练新模块
 #   验证：生成不再是噪声，主体基本能出现
+#
+# 使用方法：
+#   torchrun --nproc_per_node=8 train_opens2v.py \
+#       --config_path configs/train_opens2v.yaml \
+#       --logdir outputs/opens2v_training
 
 # ========================= 基础模型配置 =========================
 model_name: "Wan2.1-T2V-1.3B"  # 或 "Wan2.1-T2V-14B"
@@ -18,14 +23,30 @@ model_kwargs:
   sink_size: 3
 
 # ========================= 数据配置 =========================
-# OpenS2V 数据集路径 (请修改为你的实际路径)
+# OpenS2V 数据集路径
+# 注意：使用 total_part1.json 格式的数据
+# JSON 格式示例:
+#   {
+#     "key_id": {
+#       "metadata": {
+#         "path": "part_xxx/video_id/video.mp4",  # 相对于 video_base_path
+#         "face_cut": [start, end],  # 有效帧范围
+#         "face_cap_qwen": "描述文本",
+#         ...
+#       },
+#       "annotation": {...}
+#     }
+#   }
 opens2v:
   json_paths:
-    - "path/to/OpenS2V/demo_result/step5/merge_final_json/dataset1.json"
+    # 修改为你的实际路径，可以使用 total_part1.json
+    - "../total_part1.json"
   video_base_paths:
-    - "path/to/OpenS2V/demo_result/step0/videos/dataset1"
+    # 视频根目录，JSON 中的 path 字段会相对于此路径
+    - "/path/to/OpenS2V-5M/videos"
   background_base_paths:
-    - "path/to/OpenS2V/demo_result/step5/final_output/dataset1/foreground"
+    # 背景图片目录，存放 {key}.png 格式的背景图
+    - "/path/to/OpenS2V-5M/backgrounds"
 
   # 跨帧数据 (可选，is_cross_frame=False 时不使用)
   cross_frames_cluster_path: ""
@@ -40,7 +61,11 @@ opens2v:
 is_cross_frame: false
 
 # ========================= 视频参数 =========================
-num_training_frames: 21  # 训练帧数 (建议 21, OpenS2V 默认 49)
+# 注意：训练帧数应该能被 num_frame_per_block 整除
+# VAE 有 4x 时间压缩，实际 latent 帧数 = (num_training_frames + 3) // 4
+# 建议：num_training_frames = 21 -> latent 6 帧，适合快速验证
+#       num_training_frames = 49 -> latent 13 帧，与 OpenS2V 原始设置一致
+num_training_frames: 21
 pixel_height: 480
 pixel_width: 832
 
@@ -64,6 +89,8 @@ batch_size: 1  # OpenS2V 数据集建议先用 1
 num_workers: 4
 
 # ========================= Flow Matching 参数 =========================
+# num_frame_per_block 应该能整除 latent 帧数
+# 例如：latent 6 帧 -> num_frame_per_block = 3 或 2
 num_frame_per_block: 3
 num_train_timestep: 1000
 min_step_ratio: 0.02
@@ -92,7 +119,9 @@ train_fused_path: false
 
 # ========================= 检查点配置 =========================
 # 基础模型检查点 (包含双路交叉注意力)
-generator_ckpt: "path/to/dual_crossattn_checkpoint.pt"
+# 如果从头开始训练双路交叉注意力，设为空字符串 ""
+# 模型会自动初始化新增层 (clip_proj, vae_proj, k_vae, v_vae, norm_k_vae)
+generator_ckpt: ""
 
 # 预训练的 LoRA 权重 (可选)
 lora_ckpt: ""
@@ -118,6 +147,13 @@ wandb_project: "longlive_opens2v"
 wandb_save_dir: ""
 
 # ========================= CLIP 编码器 =========================
+# CLIP 模型路径，可以是 HuggingFace model ID 或本地路径
+# 如果使用本地路径，确保包含 image_encoder 和 image_processor 子目录
 clip_path: "Skywork/SkyReels-A2"
 clip_dim: 1280
 vae_latent_dim: 16
+
+# ========================= 预训练模型路径 =========================
+# 预训练模型相对路径 (在 wan_wrapper.py 中使用)
+# 默认: ../../pretrained/Wan2.1-T2V-1.3B/
+# 如果路径不对，请修改 utils/wan_wrapper.py 中的硬编码路径
