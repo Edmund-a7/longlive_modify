@@ -1,6 +1,6 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
-from typing import List, Optional
+from typing import List, Optional, Dict
 import torch
 import os
 
@@ -9,6 +9,7 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
 from utils.debug_option import DEBUG
 import torch.distributed as dist
+from wan.modules.subject_injection import SubjectFeatureBank
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -61,6 +62,9 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        reference_subjects: Optional[Dict[str, Dict]] = None,
+        injection_layers: Optional[List[int]] = None,
+        injection_strength: float = 0.3,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -69,6 +73,14 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            reference_subjects (Dict[str, Dict], optional): Dictionary mapping subject names to their info.
+                Each entry should have:
+                - "image": torch.Tensor of shape [1, 3, H, W] or [3, H, W], RGB in range [-1, 1]
+                - "token_idx": int, the text token index for this subject
+                Example: {"man": {"image": tensor, "token_idx": 5}}
+            injection_layers (List[int], optional): List of layer indices where subject injection is enabled.
+                Defaults to last 5 layers [25, 26, 27, 28, 29] if reference_subjects is provided.
+            injection_strength (float): Strength of subject feature injection (0-1).
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -154,6 +166,31 @@ class CausalInferencePipeline(torch.nn.Module):
         self._set_all_modules_max_attention_size(self.local_attn_size * self.frame_seq_length)
         # 把wan transformer中的 max_attention_size 属性都设置成 local_attn_size * frame_seq_length
 
+        # Step 1.5: Create subject feature bank if reference subjects are provided
+        subject_bank = None
+        if reference_subjects is not None:
+            print(f"[inference] Creating subject feature bank with {len(reference_subjects)} subjects")
+            feature_bank = SubjectFeatureBank(
+                vae_wrapper=self.vae,
+                patch_embedding=self.generator.model.patch_embedding,
+                device=noise.device
+            )
+            for name, info in reference_subjects.items():
+                feature_bank.add_subject(
+                    name=name,
+                    ref_image=info["image"],
+                    text_token_idx=info["token_idx"],
+                    text_token_indices=info.get("token_indices", None)
+                )
+                print(f"  - Added subject '{name}' with token_idx={info['token_idx']}")
+            subject_bank = feature_bank.get_all_subjects()
+
+            # Set default injection layers if not provided (last 5 layers)
+            if injection_layers is None:
+                injection_layers = list(range(25, 30))  # 30 blocks total
+            print(f"[inference] Subject injection enabled on layers: {injection_layers}")
+            print(f"[inference] Injection strength: {injection_strength}")
+
         if profile:
             init_end.record()
             torch.cuda.synchronize()
@@ -184,7 +221,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     # current_timestep 1000
                 # timestep = [1000,1000,1000] 
 
-                if index < len(self.denoising_step_list) - 1: 
+                if index < len(self.denoising_step_list) - 1:
                     # index = 0
                     # denosing_step_list = [1000, 750, 500, 250]
                     # len(denosing_step_list) = 4
@@ -194,7 +231,10 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep, # 标记当前是哪个时间步的噪声级别
                         kv_cache=self.kv_cache1, # 刚刚设置好的kv_cache模板
                         crossattn_cache=self.crossattn_cache, # 刚刚设置好的crossattn_cache模板
-                        current_start=current_start_frame * self.frame_seq_length # 当前这段开始的token位置
+                        current_start=current_start_frame * self.frame_seq_length, # 当前这段开始的token位置
+                        subject_bank=subject_bank,
+                        injection_layers=injection_layers,
+                        injection_strength=injection_strength
                     )
                     # 得到对当前3帧的干净latent，即x_0的估计，用于下一步加噪或最终输出。
                     # 拿着局部的噪声块 + 文本条件 + 缓存状态，跑一次 Wan Causal Transformer
@@ -217,7 +257,10 @@ class CausalInferencePipeline(torch.nn.Module):
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        subject_bank=subject_bank,
+                        injection_layers=injection_layers,
+                        injection_strength=injection_strength
                     )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)

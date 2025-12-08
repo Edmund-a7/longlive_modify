@@ -158,13 +158,19 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(self, x, context, context_lens, crossattn_cache=None,
+                return_attn_scores=False, subject_bank=None, grid_sizes=None,
+                injection_strength=0.3):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
             crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
+            return_attn_scores (bool): If True, use standard attention to get attention scores for subject injection.
+            subject_bank (dict, *optional*): Subject feature bank for injection.
+            grid_sizes (Tensor, *optional*): Shape [B, 3] containing (T, H, W) for reshaping attention maps.
+            injection_strength (float): Strength of subject feature injection.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
@@ -185,12 +191,25 @@ class WanT2VCrossAttention(WanSelfAttention):
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        # Check if we need attention scores for subject injection
+        if return_attn_scores and subject_bank:
+            # Use standard attention to get attention scores
+            from wan.modules.subject_injection import attention_with_scores, inject_subject_features
+            x_out, attn_scores = attention_with_scores(q, k, v)
+            x_out = x_out.flatten(2)
 
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
+            # Inject subject features based on attention maps
+            x_out = inject_subject_features(
+                x_out, attn_scores, subject_bank,
+                grid_sizes, injection_strength
+            )
+            x = self.o(x_out)
+        else:
+            # Use Flash Attention for efficiency
+            x = flash_attention(q, k, v, k_lens=context_lens)
+            x = x.flatten(2)
+            x = self.o(x)
+
         return x
 
 

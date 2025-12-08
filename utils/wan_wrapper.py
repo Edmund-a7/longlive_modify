@@ -231,7 +231,10 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        subject_bank: Optional[dict] = None,
+        injection_layers: Optional[List[int]] = None,
+        injection_strength: float = 0.3
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
         # 提取文本嵌入编码
@@ -252,7 +255,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start, # current_start = 0
-                cache_start=cache_start
+                cache_start=cache_start,
+                subject_bank=subject_bank,
+                injection_layers=injection_layers,
+                injection_strength=injection_strength
             ).permute(0, 2, 1, 3, 4)
             # 把噪声块和条件送进 CausalWanModel 做一次前向推理，得到推理结果
         else:

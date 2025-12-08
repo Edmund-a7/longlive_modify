@@ -408,7 +408,10 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        subject_bank=None,
+        enable_subject_injection=False,
+        injection_strength=0.3
     ):
         r"""
         Args:
@@ -417,6 +420,9 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            subject_bank(dict, *optional*): Subject feature bank for injection.
+            enable_subject_injection(bool): Whether to enable subject injection in this block.
+            injection_strength(float): Strength of subject feature injection.
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
@@ -429,7 +435,7 @@ class CausalWanAttentionBlock(nn.Module):
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start)
-        
+
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
         else:
@@ -441,8 +447,14 @@ class CausalWanAttentionBlock(nn.Module):
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
-            x = x + self.cross_attn(self.norm3(x), context,
-                                    context_lens, crossattn_cache=crossattn_cache)
+            x = x + self.cross_attn(
+                self.norm3(x), context, context_lens,
+                crossattn_cache=crossattn_cache,
+                return_attn_scores=enable_subject_injection,
+                subject_bank=subject_bank,
+                grid_sizes=grid_sizes,
+                injection_strength=injection_strength
+            )
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -453,7 +465,7 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
-        
+
         if cache_update_info is not None:
             # cache_update_info is already in the format (current_end, local_end_index, cache_update_info)
             return x, cache_update_info
@@ -903,7 +915,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        subject_bank: dict = None,
+        injection_layers: list = None,
+        injection_strength: float = 0.3
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -924,6 +939,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            subject_bank (dict, *optional*):
+                Subject feature bank for multi-subject consistency injection.
+            injection_layers (list, *optional*):
+                List of layer indices where subject injection should be enabled.
+            injection_strength (float):
+                Strength of subject feature injection.
 
         Returns:
             List[Tensor]:
@@ -1015,13 +1036,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
         for block_index, block in enumerate(self.blocks):
+            # Determine if subject injection should be enabled for this block
+            enable_subject_injection = (
+                subject_bank is not None and
+                injection_layers is not None and
+                block_index in injection_layers
+            )
+
             # print(f"block_index: {block_index}") # block_index: 0 block: CausalWanAttentionBlock
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "subject_bank": subject_bank if enable_subject_injection else None,
+                        "enable_subject_injection": enable_subject_injection,
+                        "injection_strength": injection_strength
                     }
                 )
                 # print(f"forward checkpointing")
@@ -1044,7 +1075,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "subject_bank": subject_bank if enable_subject_injection else None,
+                        "enable_subject_injection": enable_subject_injection,
+                        "injection_strength": injection_strength
                     }
                 )
                 # 注入当前 block 的状态
