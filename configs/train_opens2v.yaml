@@ -1,0 +1,123 @@
+# OpenS2V Training Configuration
+# SPDX-License-Identifier: CC-BY-NC-SA-4.0
+#
+# 训练目标：
+#   输入：subject_image + text
+#   目标：生成的视频，包含参考图中的主体
+#   数据：is_cross_frame=False
+#   训练：冻结原模型，只训练新模块
+#   验证：生成不再是噪声，主体基本能出现
+
+# ========================= 基础模型配置 =========================
+model_name: "Wan2.1-T2V-1.3B"  # 或 "Wan2.1-T2V-14B"
+timestep_shift: 5.0
+
+# 模型参数
+model_kwargs:
+  local_attn_size: 12
+  sink_size: 3
+
+# ========================= 数据配置 =========================
+# OpenS2V 数据集路径 (请修改为你的实际路径)
+opens2v:
+  json_paths:
+    - "path/to/OpenS2V/demo_result/step5/merge_final_json/dataset1.json"
+  video_base_paths:
+    - "path/to/OpenS2V/demo_result/step0/videos/dataset1"
+  background_base_paths:
+    - "path/to/OpenS2V/demo_result/step5/final_output/dataset1/foreground"
+
+  # 跨帧数据 (可选，is_cross_frame=False 时不使用)
+  cross_frames_cluster_path: ""
+  cross_frames_base_path: ""
+
+  # 数据集参数
+  sample_stride: 3  # 帧采样步长
+  max_subjects_per_sample: 1  # 每个样本使用的 subject 数量
+  subject_selection: "first"  # 'first', 'random', 'best_score'
+
+# 是否使用跨帧数据
+is_cross_frame: false
+
+# ========================= 视频参数 =========================
+num_training_frames: 21  # 训练帧数 (建议 21, OpenS2V 默认 49)
+pixel_height: 480
+pixel_width: 832
+
+# ========================= 训练参数 =========================
+# 优化器
+lr: 1.0e-4
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+
+# 梯度
+max_grad_norm: 1.0
+gradient_accumulation_steps: 1
+
+# 训练轮次
+max_iters: 10000
+log_iters: 500  # 保存检查点间隔
+
+# 批次大小
+batch_size: 1  # OpenS2V 数据集建议先用 1
+num_workers: 4
+
+# ========================= Flow Matching 参数 =========================
+num_frame_per_block: 3
+num_train_timestep: 1000
+min_step_ratio: 0.02
+max_step_ratio: 0.98
+
+# 损失函数
+denoising_loss_type: "flow"  # flow matching loss
+
+# ========================= 模型冻结与训练 =========================
+# 是否训练 fused 路径 (可选)
+train_fused_path: false
+
+# 可训练参数模式 (在 RefImgFlowMatchingModel 中定义):
+# - clip_proj: CLIP 投影层
+# - vae_proj: VAE 投影层
+# - k_vae/v_vae/norm_k_vae: VAE 路径交叉注意力
+
+# ========================= LoRA 配置 (可选) =========================
+# 如果想额外应用 LoRA 微调，取消下面的注释
+# adapter:
+#   adapter_type: "lora"
+#   r: 64
+#   lora_alpha: 64
+#   lora_dropout: 0.0
+#   target_modules: ["to_q", "to_k", "to_v", "to_out"]
+
+# ========================= 检查点配置 =========================
+# 基础模型检查点 (包含双路交叉注意力)
+generator_ckpt: "path/to/dual_crossattn_checkpoint.pt"
+
+# 预训练的 LoRA 权重 (可选)
+lora_ckpt: ""
+
+# 自动恢复
+auto_resume: true
+max_checkpoints: 5  # 保留最近的 N 个检查点
+
+# ========================= 分布式训练 =========================
+mixed_precision: true  # 使用 bfloat16
+sharding_strategy: "hybrid_full"  # FSDP 分片策略
+generator_fsdp_wrap_strategy: "size"
+
+# ========================= 其他 =========================
+seed: 0  # 0 表示随机种子
+gc_interval: 100  # 垃圾回收间隔
+
+# ========================= WandB 日志 =========================
+disable_wandb: true  # 是否禁用 WandB
+wandb_key: ""
+wandb_entity: ""
+wandb_project: "longlive_opens2v"
+wandb_save_dir: ""
+
+# ========================= CLIP 编码器 =========================
+clip_path: "Skywork/SkyReels-A2"
+clip_dim: 1280
+vae_latent_dim: 16
