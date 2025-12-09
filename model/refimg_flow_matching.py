@@ -106,6 +106,7 @@ class RefImgFlowMatchingModel(nn.Module):
         """设置可训练参数
 
         冻结所有参数，只解冻参考图相关的新增层。
+        注意：此方法必须在 FSDP 包装之前调用，以便通过原始参数名匹配可训练层。
         """
         # 先冻结所有参数
         for param in self.generator.parameters():
@@ -120,7 +121,9 @@ class RefImgFlowMatchingModel(nn.Module):
                 param.requires_grad = True
                 trainable_count += param.numel()
 
-        if dist.get_rank() == 0:
+        # 安全地检查是否是主进程（处理未初始化的情况）
+        is_main = not dist.is_initialized() or dist.get_rank() == 0
+        if is_main:
             print(f"Trainable parameters: {trainable_count:,} / {total_count:,} "
                   f"({100 * trainable_count / total_count:.2f}%)")
             print(f"Trainable patterns: {self.trainable_patterns}")

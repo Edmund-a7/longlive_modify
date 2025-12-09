@@ -20,6 +20,15 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
+def _collect_conv3d_modules(module):
+    """收集模块中所有的 Conv3d 层，用于 FSDP ignored_modules"""
+    conv3d_modules = set()
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, torch.nn.Conv3d):
+            conv3d_modules.add(submodule)
+    return conv3d_modules
+
+
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):
     if mixed_precision:
         mixed_precision_policy = MixedPrecision(
@@ -61,6 +70,10 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         "no_shard": ShardingStrategy.NO_SHARD,
     }[sharding_strategy]
 
+    # 收集所有 Conv3d 模块，排除在 FSDP 分片之外
+    # Conv3d 在 use_orig_params=True 时有兼容性问题，需要通过 ignored_modules 排除
+    ignored_modules = _collect_conv3d_modules(module)
+
     module = FSDP(
         module,
         auto_wrap_policy=auto_wrap_policy,
@@ -68,9 +81,10 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         mixed_precision=mixed_precision_policy,
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,
-        use_orig_params=False,  # Must be False for Conv3d compatibility; freeze params AFTER FSDP wrapping
+        use_orig_params=True,  # Must be True to preserve original param names for selective freezing
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=True  # Sync model states from rank 0 to all other ranks
+        sync_module_states=True,  # Sync model states from rank 0 to all other ranks
+        ignored_modules=ignored_modules,  # Exclude Conv3d modules to avoid compatibility issues
     )
     return module
 
