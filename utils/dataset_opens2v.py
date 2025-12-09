@@ -156,6 +156,10 @@ class OpenS2VDataset(Dataset):
         n_frames = self.sample_num_frames
         sample_stride = self.sample_stride
 
+        # 边界检查
+        if adjusted_length <= 0:
+            raise ValueError(f"Invalid frame range: start={valid_start}, end={valid_end}")
+
         if adjusted_length <= n_frames:
             # 视频太短，需要重复帧
             indices = list(range(adjusted_length))
@@ -291,11 +295,16 @@ class OpenS2VDataset(Dataset):
             try:
                 decord.bridge.set_bridge("torch")
                 vr = VideoReader(video_path, num_threads=2)
+                total_frames = len(vr)
 
                 # 获取裁剪和有效帧范围
                 crop = metadata.get("crop", [0, vr[0].shape[1], 0, vr[0].shape[0]])
                 s_x, e_x, s_y, e_y = crop
                 start_frame, end_frame = metadata["face_cut"]
+
+                # 确保帧范围有效
+                start_frame = max(0, start_frame)
+                end_frame = min(total_frames, end_frame)
 
                 # 采样帧索引
                 frame_indices = self._get_frame_indices(start_frame, end_frame)
@@ -308,7 +317,9 @@ class OpenS2VDataset(Dataset):
 
                 # 读取标注帧用于提取 subject
                 ann_frame_idx = annotation["ann_frame_data"]["ann_frame_idx"]
-                ann_frame = vr.get_batch([int(ann_frame_idx)]).numpy()[0]  # [H, W, C] RGB
+                # 确保标注帧索引在有效范围内
+                ann_frame_idx = max(0, min(int(ann_frame_idx), total_frames - 1))
+                ann_frame = vr.get_batch([ann_frame_idx]).numpy()[0]  # [H, W, C] RGB
                 ann_frame = ann_frame[..., ::-1].copy()  # RGB -> BGR (for cv2), copy to make contiguous
                 ann_frame = ann_frame[s_y:e_y, s_x:e_x]  # 裁剪
 
