@@ -160,6 +160,13 @@ class OpenS2VTrainer:
         if self.is_main_process:
             print("\n[4/6] Applying FSDP...")
 
+        # 在 FSDP 包装前，先将 generator 移到 GPU
+        # 这是 sync_module_states=True 所必需的
+        self.model.generator = self.model.generator.to(device=self.device)
+
+        # 同步所有进程，确保模型状态一致
+        dist.barrier()
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=getattr(config, "sharding_strategy", "hybrid_full"),
