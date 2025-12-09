@@ -106,13 +106,15 @@ class WanVAEWrapper(torch.nn.Module):
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
-        device, dtype = pixel.device, pixel.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        device = pixel.device
+        # VAE 必须在 float32 下运行
+        pixel_fp32 = pixel.float()
+        scale = [self.mean.to(device=device, dtype=torch.float32),
+                 1.0 / self.std.to(device=device, dtype=torch.float32)]
 
         output = [
             self.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
-            for u in pixel
+            for u in pixel_fp32
         ]
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
@@ -125,9 +127,11 @@ class WanVAEWrapper(torch.nn.Module):
         if use_cache:
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
 
-        device, dtype = latent.device, latent.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        device = latent.device
+        # VAE 必须在 float32 下运行
+        zs_fp32 = zs.float()
+        scale = [self.mean.to(device=device, dtype=torch.float32),
+                 1.0 / self.std.to(device=device, dtype=torch.float32)]
 
         if use_cache:
             decode_function = self.model.cached_decode
@@ -135,7 +139,7 @@ class WanVAEWrapper(torch.nn.Module):
             decode_function = self.model.decode
 
         output = []
-        for u in zs:
+        for u in zs_fp32:
             output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
