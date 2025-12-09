@@ -137,28 +137,27 @@ class OpenS2VTrainer:
             if self.is_main_process:
                 print(f"\n  Warning: LoRA checkpoint not found: {lora_ckpt_path}")
 
-        # 设置可训练参数（冻结除新增层外的所有参数）
-        if self.is_main_process:
-            print("\n[2/6] Setting up trainable parameters...")
-        self.model.setup_trainable_params()
+        # NOTE: 不要在这里调用 setup_trainable_params()
+        # FSDP 使用 use_orig_params=False 时，要求包装时所有参数的 requires_grad 状态一致
+        # 因此必须在 FSDP 包装之后再冻结参数
 
-        # ========================= Step 3: 新 LoRA 配置 (可选) =========================
+        # ========================= Step 2: 新 LoRA 配置 (可选) =========================
         self.is_lora_enabled = False
         self.lora_config = None
 
         if hasattr(config, 'adapter') and config.adapter is not None:
             if self.is_main_process:
-                print("\n[3/6] Applying new LoRA for training...")
+                print("\n[2/6] Applying new LoRA for training...")
             self.is_lora_enabled = True
             self.lora_config = config.adapter
             self._apply_lora()
         else:
             if self.is_main_process:
-                print("\n[3/6] No new LoRA adapter, training new layers directly...")
+                print("\n[2/6] No new LoRA adapter, training new layers directly...")
 
-        # ========================= Step 4: FSDP 包装 =========================
+        # ========================= Step 3: FSDP 包装 =========================
         if self.is_main_process:
-            print("\n[4/6] Applying FSDP...")
+            print("\n[3/6] Applying FSDP...")
 
         # 在 FSDP 包装前，先将 generator 移到 GPU
         # 这是 sync_module_states=True 所必需的
@@ -177,6 +176,13 @@ class OpenS2VTrainer:
         # 移动其他模型到 GPU
         self.model.vae = self.model.vae.to(device=self.device)
         self.model.clip_encoder = self.model.clip_encoder.to(device=self.device)
+
+        # ========================= Step 4: 设置可训练参数 =========================
+        # 重要：必须在 FSDP 包装之后设置可训练参数
+        # 因为 use_orig_params=False 时，FSDP 要求包装时所有参数的 requires_grad 状态一致
+        if self.is_main_process:
+            print("\n[4/6] Setting up trainable parameters...")
+        self.model.setup_trainable_params()
 
         # ========================= Step 5: 优化器初始化 =========================
         if self.is_main_process:

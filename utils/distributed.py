@@ -68,7 +68,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         mixed_precision=mixed_precision_policy,
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,
-        use_orig_params=True,  # Must be True to support mixed requires_grad (partial freezing)
+        use_orig_params=False,  # Must be False for Conv3d compatibility; freeze params AFTER FSDP wrapping
         cpu_offload=CPUOffload(offload_params=cpu_offload),
         sync_module_states=True  # Sync model states from rank 0 to all other ranks
     )
