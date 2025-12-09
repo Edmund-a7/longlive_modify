@@ -275,45 +275,53 @@ class OpenS2VDataset(Dataset):
             return subjects[:self.max_subjects]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        key = self.keys[idx]
-        item = self.data[key]
-        metadata = item["metadata"]
-        annotation = item["annotation"]
+        # 用循环代替递归，避免递归深度超限
+        max_retries = 100
+        original_idx = idx
 
-        # 构建视频路径
-        video_path = os.path.join(self.video_base_path, metadata["path"])
+        for retry in range(max_retries):
+            key = self.keys[idx]
+            item = self.data[key]
+            metadata = item["metadata"]
+            annotation = item["annotation"]
 
-        try:
-            decord.bridge.set_bridge("torch")
-            vr = VideoReader(video_path, num_threads=2)
+            # 构建视频路径
+            video_path = os.path.join(self.video_base_path, metadata["path"])
 
-            # 获取裁剪和有效帧范围
-            crop = metadata.get("crop", [0, vr[0].shape[1], 0, vr[0].shape[0]])
-            s_x, e_x, s_y, e_y = crop
-            start_frame, end_frame = metadata["face_cut"]
+            try:
+                decord.bridge.set_bridge("torch")
+                vr = VideoReader(video_path, num_threads=2)
 
-            # 采样帧索引
-            frame_indices = self._get_frame_indices(start_frame, end_frame)
+                # 获取裁剪和有效帧范围
+                crop = metadata.get("crop", [0, vr[0].shape[1], 0, vr[0].shape[0]])
+                s_x, e_x, s_y, e_y = crop
+                start_frame, end_frame = metadata["face_cut"]
 
-            # 读取视频帧
-            video = vr.get_batch(frame_indices).float()  # [T, H, W, C]
-            video = video.permute(0, 3, 1, 2)  # [T, C, H, W]
-            video = video[:, :, s_y:e_y, s_x:e_x]  # 裁剪去水印
-            video = self._resize_and_crop(video)  # resize
+                # 采样帧索引
+                frame_indices = self._get_frame_indices(start_frame, end_frame)
 
-            # 读取标注帧用于提取 subject
-            ann_frame_idx = annotation["ann_frame_data"]["ann_frame_idx"]
-            ann_frame = vr.get_batch([int(ann_frame_idx)]).asnumpy()[0]  # [H, W, C] RGB
-            ann_frame = ann_frame[..., ::-1]  # RGB -> BGR (for cv2)
-            ann_frame = ann_frame[s_y:e_y, s_x:e_x]  # 裁剪
+                # 读取视频帧
+                video = vr.get_batch(frame_indices).float()  # [T, H, W, C]
+                video = video.permute(0, 3, 1, 2)  # [T, C, H, W]
+                video = video[:, :, s_y:e_y, s_x:e_x]  # 裁剪去水印
+                video = self._resize_and_crop(video)  # resize
 
-            del vr
-            gc.collect()
+                # 读取标注帧用于提取 subject
+                ann_frame_idx = annotation["ann_frame_data"]["ann_frame_idx"]
+                ann_frame = vr.get_batch([int(ann_frame_idx)]).asnumpy()[0]  # [H, W, C] RGB
+                ann_frame = ann_frame[..., ::-1]  # RGB -> BGR (for cv2)
+                ann_frame = ann_frame[s_y:e_y, s_x:e_x]  # 裁剪
 
-        except Exception as e:
-            print(f"Error loading video {video_path}: {e}")
-            # 返回空数据，让 DataLoader 跳过
-            return self.__getitem__((idx + 1) % len(self))
+                del vr
+                gc.collect()
+                break  # 成功加载，跳出循环
+
+            except Exception as e:
+                print(f"Error loading video {video_path}: {e}")
+                # 尝试下一个索引
+                idx = (idx + 1) % len(self)
+                if retry == max_retries - 1:
+                    raise RuntimeError(f"Failed to load any video after {max_retries} retries starting from idx {original_idx}")
 
         # 提取 subjects
         subjects = self._extract_subjects(ann_frame, annotation, ann_frame_idx)
