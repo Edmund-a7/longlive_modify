@@ -16,6 +16,12 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
+
+    # 确保 position 是至少 1D 的张量
+    # 处理标量输入的情况（如 batch_size=1 时的边缘情况）
+    if position.dim() == 0:
+        position = position.unsqueeze(0)
+
     position = position.type(torch.float64)
 
     # calculation

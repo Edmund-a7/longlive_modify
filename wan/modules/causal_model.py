@@ -1283,6 +1283,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         else:
             t_for_emb = t  # [B]
 
+        # 确保 t_for_emb 是正确的形状（处理标量的情况）
+        if t_for_emb.dim() == 0:
+            t_for_emb = t_for_emb.unsqueeze(0)  # 标量 -> [1]
+
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t_for_emb).type_as(x))
 
