@@ -118,7 +118,10 @@ class OpenS2VTrainer:
                     print(f"    Sample missing keys: {missing[:5]}")
 
         # 加载预训练的 LoRA 权重（可选）
+        # 注意：PEFT 格式的 LoRA 权重需要先添加 adapter 再加载
         lora_ckpt_path = getattr(config, "lora_ckpt", None)
+        self._pretrained_lora_state_dict = None  # 保存以便后续加载
+
         if lora_ckpt_path and os.path.exists(lora_ckpt_path):
             if self.is_main_process:
                 print(f"\n  Loading pretrained LoRA weights: {lora_ckpt_path}")
@@ -129,10 +132,21 @@ class OpenS2VTrainer:
             else:
                 lora_state_dict = lora_checkpoint
 
-            missing, unexpected = self.model.generator.load_state_dict(lora_state_dict, strict=False)
-            if self.is_main_process:
-                loaded_count = len(lora_state_dict) - len(unexpected)
-                print(f"    LoRA weights loaded: {loaded_count}, Unexpected: {len(unexpected)}")
+            # 检测是否是 PEFT 格式（包含 lora_A/lora_B 的 key）
+            sample_key = list(lora_state_dict.keys())[0] if lora_state_dict else ""
+            is_peft_format = 'lora_A' in sample_key or 'lora_B' in sample_key
+
+            if is_peft_format:
+                if self.is_main_process:
+                    print(f"    检测到 PEFT 格式的 LoRA 权重，将在添加 adapter 后加载")
+                # 保存 state dict，在 _apply_lora 后加载
+                self._pretrained_lora_state_dict = lora_state_dict
+            else:
+                # 非 PEFT 格式，直接加载
+                missing, unexpected = self.model.generator.load_state_dict(lora_state_dict, strict=False)
+                if self.is_main_process:
+                    loaded_count = len(lora_state_dict) - len(unexpected)
+                    print(f"    LoRA weights loaded: {loaded_count}, Unexpected: {len(unexpected)}")
         elif lora_ckpt_path:
             if self.is_main_process:
                 print(f"\n  Warning: LoRA checkpoint not found: {lora_ckpt_path}")
@@ -145,19 +159,26 @@ class OpenS2VTrainer:
             print("\n[2/6] Setting up trainable parameters...")
         self.model.setup_trainable_params()
 
-        # ========================= Step 3: 新 LoRA 配置 (可选) =========================
+        # ========================= Step 3: LoRA 配置 =========================
         self.is_lora_enabled = False
         self.lora_config = None
 
+        # 情况1: 配置中有新的 adapter 配置
         if hasattr(config, 'adapter') and config.adapter is not None:
             if self.is_main_process:
                 print("\n[3/6] Applying new LoRA for training...")
             self.is_lora_enabled = True
             self.lora_config = config.adapter
             self._apply_lora()
+        # 情况2: 有预训练的 PEFT LoRA 权重需要加载（但没有新的 adapter 配置）
+        elif self._pretrained_lora_state_dict is not None:
+            if self.is_main_process:
+                print("\n[3/6] Loading pretrained PEFT LoRA weights (inference mode)...")
+            # 从 checkpoint 的 key 推断 LoRA 配置
+            self._apply_lora_from_checkpoint()
         else:
             if self.is_main_process:
-                print("\n[3/6] No new LoRA adapter, training new layers directly...")
+                print("\n[3/6] No LoRA adapter, training new layers directly...")
 
         # ========================= Step 4: FSDP 包装 =========================
         if self.is_main_process:
@@ -250,7 +271,7 @@ class OpenS2VTrainer:
 
     def _apply_lora(self):
         """应用新的 LoRA 配置到 generator（可选）"""
-        from utils.lora_utils import configure_lora_for_model
+        from utils.lora_utils import configure_lora_for_model, load_lora_checkpoint
 
         self.model.generator.model = configure_lora_for_model(
             self.model.generator.model,
@@ -258,6 +279,82 @@ class OpenS2VTrainer:
             lora_config=self.lora_config,
             is_main_process=self.is_main_process
         )
+
+        # 如果有预训练的 PEFT LoRA 权重，在添加 adapter 后加载
+        if self._pretrained_lora_state_dict is not None:
+            if self.is_main_process:
+                print(f"    加载预训练 PEFT LoRA 权重...")
+            load_lora_checkpoint(
+                self.model.generator.model,
+                self._pretrained_lora_state_dict,
+                model_name="generator",
+                is_main_process=self.is_main_process
+            )
+            self._pretrained_lora_state_dict = None  # 释放内存
+
+    def _apply_lora_from_checkpoint(self):
+        """从预训练的 PEFT LoRA checkpoint 推断配置并加载权重"""
+        from utils.lora_utils import load_lora_checkpoint
+        import peft
+
+        lora_state_dict = self._pretrained_lora_state_dict
+
+        # 从 checkpoint key 推断 LoRA rank
+        # key 格式: base_model.model.blocks.0.self_attn.q.lora_A.weight
+        # lora_A.weight 的 shape 是 [rank, in_features]
+        lora_rank = None
+        for key, value in lora_state_dict.items():
+            if 'lora_A' in key and 'weight' in key:
+                lora_rank = value.shape[0]
+                break
+
+        if lora_rank is None:
+            raise ValueError("无法从 LoRA checkpoint 推断 rank")
+
+        if self.is_main_process:
+            print(f"    从 checkpoint 推断 LoRA rank: {lora_rank}")
+
+        # 从 checkpoint key 提取 target modules
+        # 需要移除 'base_model.model.' 前缀和 '.lora_A.weight' / '.lora_B.weight' 后缀
+        target_modules = set()
+        for key in lora_state_dict.keys():
+            if 'lora_A' in key or 'lora_B' in key:
+                # 移除前缀和后缀
+                module_name = key.replace('base_model.model.', '')
+                module_name = module_name.replace('.lora_A.weight', '')
+                module_name = module_name.replace('.lora_B.weight', '')
+                target_modules.add(module_name)
+
+        target_modules = list(target_modules)
+
+        if self.is_main_process:
+            print(f"    从 checkpoint 推断 target modules: {len(target_modules)} 个")
+
+        # 创建 LoRA 配置
+        peft_config = peft.LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_rank,  # 默认 alpha = rank
+            lora_dropout=0.0,
+            target_modules=target_modules,
+        )
+
+        # 应用 LoRA 到模型
+        self.model.generator.model = peft.get_peft_model(
+            self.model.generator.model, peft_config
+        )
+        self.is_lora_enabled = True
+
+        if self.is_main_process:
+            self.model.generator.model.print_trainable_parameters()
+
+        # 加载权重
+        load_lora_checkpoint(
+            self.model.generator.model,
+            lora_state_dict,
+            model_name="generator",
+            is_main_process=self.is_main_process
+        )
+        self._pretrained_lora_state_dict = None  # 释放内存
 
     def _load_checkpoint(self):
         """加载训练检查点"""
