@@ -308,8 +308,8 @@ class OpenS2VDataset(Dataset):
 
                 # 读取标注帧用于提取 subject
                 ann_frame_idx = annotation["ann_frame_data"]["ann_frame_idx"]
-                ann_frame = vr.get_batch([int(ann_frame_idx)]).asnumpy()[0]  # [H, W, C] RGB
-                ann_frame = ann_frame[..., ::-1]  # RGB -> BGR (for cv2)
+                ann_frame = vr.get_batch([int(ann_frame_idx)]).numpy()[0]  # [H, W, C] RGB
+                ann_frame = ann_frame[..., ::-1].copy()  # RGB -> BGR (for cv2), copy to make contiguous
                 ann_frame = ann_frame[s_y:e_y, s_x:e_x]  # 裁剪
 
                 del vr
