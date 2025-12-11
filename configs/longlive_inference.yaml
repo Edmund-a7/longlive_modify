@@ -10,6 +10,10 @@ model_kwargs:
   local_attn_size: 12
   timestep_shift: 5.0
   sink_size: 3
+  # 启用参考图支持 (模型层面)
+  use_reference_image: true
+  clip_dim: 1280
+  vae_latent_dim: 16
 
 
 # inference
@@ -24,8 +28,8 @@ save_with_index: true
 global_sink: true
 context_noise: 0
 
-generator_ckpt: longlive_models/models/longlive_base.pt
-lora_ckpt: longlive_models/models/lora.pt
+generator_ckpt: longlive_models/models/longlive_base_new_dual.pt
+lora_ckpt: longlive_models/models/lora_dual.pt
 
 adapter:
   type: "lora"

@@ -181,7 +181,12 @@ if getattr(config, "adapter", None) and configure_lora_for_model is not None:
 
 
 # Move pipeline to appropriate dtype and device
-pipeline = pipeline.to(dtype=torch.bfloat16)
+# 注意: VAE 必须保持 float32，否则解码时会有 dtype 不匹配问题
+pipeline.generator = pipeline.generator.to(dtype=torch.bfloat16)
+pipeline.text_encoder = pipeline.text_encoder.to(dtype=torch.bfloat16)
+# VAE 保持 float32
+pipeline.vae = pipeline.vae.to(dtype=torch.float32)
+
 if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
 pipeline.generator.to(device=device)
