@@ -1450,3 +1450,53 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+        # 零初始化参考图相关权重，确保未训练时模型忽略参考图输入
+        if self.use_reference_image:
+            # MLP 投影层: 将最后一个 Linear 层 (proj.3) 权重设为 0
+            # 这样 clip_proj 和 vae_proj 的输出为 0，不影响原始模型
+            nn.init.zeros_(self.clip_proj.proj[3].weight)
+            if self.clip_proj.proj[3].bias is not None:
+                nn.init.zeros_(self.clip_proj.proj[3].bias)
+            nn.init.zeros_(self.vae_proj.proj[3].weight)
+            if self.vae_proj.proj[3].bias is not None:
+                nn.init.zeros_(self.vae_proj.proj[3].bias)
+
+            # 双路交叉注意力: 将 VAE 路径的 v_vae 权重设为 0
+            # 这样 VAE 路径的贡献为 0，只保留原始的 fused 路径
+            for block in self.blocks:
+                if hasattr(block, 'cross_attn') and hasattr(block.cross_attn, 'v_vae'):
+                    nn.init.zeros_(block.cross_attn.v_vae.weight)
+                    if block.cross_attn.v_vae.bias is not None:
+                        nn.init.zeros_(block.cross_attn.v_vae.bias)
+
+    def zero_reference_image_weights(self):
+        """将参考图相关权重设为零，使模型在未训练状态下忽略参考图输入。
+
+        此方法可在加载已有 checkpoint 后调用，用于将参考图相关的新增层权重
+        重置为零，确保模型行为与原始模型一致。
+
+        使用示例:
+            model = CausalWanModel.from_pretrained(...)
+            model.zero_reference_image_weights()
+        """
+        if not self.use_reference_image:
+            print("Warning: use_reference_image is False, no weights to zero.")
+            return
+
+        # MLP 投影层: 将最后一个 Linear 层权重设为 0
+        nn.init.zeros_(self.clip_proj.proj[3].weight)
+        if self.clip_proj.proj[3].bias is not None:
+            nn.init.zeros_(self.clip_proj.proj[3].bias)
+        nn.init.zeros_(self.vae_proj.proj[3].weight)
+        if self.vae_proj.proj[3].bias is not None:
+            nn.init.zeros_(self.vae_proj.proj[3].bias)
+
+        # 双路交叉注意力: 将 VAE 路径的 v_vae 权重设为 0
+        for block in self.blocks:
+            if hasattr(block, 'cross_attn') and hasattr(block.cross_attn, 'v_vae'):
+                nn.init.zeros_(block.cross_attn.v_vae.weight)
+                if block.cross_attn.v_vae.bias is not None:
+                    nn.init.zeros_(block.cross_attn.v_vae.bias)
+
+        print("Reference image weights have been zeroed out.")

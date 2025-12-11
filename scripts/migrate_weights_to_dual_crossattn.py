@@ -25,7 +25,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 
-def create_mlp_proj_weights(in_dim: int, out_dim: int, dtype=torch.float32):
+def create_mlp_proj_weights(in_dim: int, out_dim: int, dtype=torch.float32, zero_output: bool = True):
     """创建 MLP 投影层的初始化权重 (CLIPProjMLP / VAEProjMLP 结构)
 
     结构: LayerNorm -> Linear -> GELU -> Linear -> LayerNorm
@@ -34,6 +34,10 @@ def create_mlp_proj_weights(in_dim: int, out_dim: int, dtype=torch.float32):
     proj.2: GELU (无参数)
     proj.3: Linear(out_dim, out_dim)
     proj.4: LayerNorm(out_dim)
+
+    Args:
+        zero_output: 如果为 True，将最后一个 Linear 层 (proj.3) 权重设为 0，
+                     确保未训练时 MLP 输出为零，不影响原始模型
     """
     weights = {}
 
@@ -50,9 +54,13 @@ def create_mlp_proj_weights(in_dim: int, out_dim: int, dtype=torch.float32):
     # proj.2: GELU - 无参数
 
     # proj.3: Linear(out_dim, out_dim)
-    w3 = torch.empty(out_dim, out_dim, dtype=dtype)
-    nn.init.xavier_uniform_(w3)
-    weights['proj.3.weight'] = w3
+    if zero_output:
+        # 零初始化: 确保未训练时输出为 0
+        weights['proj.3.weight'] = torch.zeros(out_dim, out_dim, dtype=dtype)
+    else:
+        w3 = torch.empty(out_dim, out_dim, dtype=dtype)
+        nn.init.xavier_uniform_(w3)
+        weights['proj.3.weight'] = w3
     weights['proj.3.bias'] = torch.zeros(out_dim, dtype=dtype)
 
     # proj.4: LayerNorm(out_dim)
@@ -62,13 +70,17 @@ def create_mlp_proj_weights(in_dim: int, out_dim: int, dtype=torch.float32):
     return weights
 
 
-def create_dual_crossattn_weights(dim: int, dtype=torch.float32):
-    """创建双路交叉注意力层的 VAE 路径权重 (随机初始化)
+def create_dual_crossattn_weights(dim: int, dtype=torch.float32, zero_v_vae: bool = True):
+    """创建双路交叉注意力层的 VAE 路径权重
 
     需要初始化:
     - k_vae: Linear(dim, dim)
     - v_vae: Linear(dim, dim)
     - norm_k_vae: WanRMSNorm(dim) - 只有 weight，无 bias
+
+    Args:
+        zero_v_vae: 如果为 True，将 v_vae 权重设为 0，
+                    确保未训练时 VAE 路径输出为零，不影响原始模型
     """
     weights = {}
 
@@ -79,9 +91,13 @@ def create_dual_crossattn_weights(dim: int, dtype=torch.float32):
     weights['k_vae.bias'] = torch.zeros(dim, dtype=dtype)
 
     # v_vae
-    v_vae_w = torch.empty(dim, dim, dtype=dtype)
-    nn.init.xavier_uniform_(v_vae_w)
-    weights['v_vae.weight'] = v_vae_w
+    if zero_v_vae:
+        # 零初始化: 确保未训练时 VAE 路径贡献为 0
+        weights['v_vae.weight'] = torch.zeros(dim, dim, dtype=dtype)
+    else:
+        v_vae_w = torch.empty(dim, dim, dtype=dtype)
+        nn.init.xavier_uniform_(v_vae_w)
+        weights['v_vae.weight'] = v_vae_w
     weights['v_vae.bias'] = torch.zeros(dim, dtype=dtype)
 
     # norm_k_vae (WanRMSNorm 只有 weight)
